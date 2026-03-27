@@ -1,0 +1,29 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+*.log
+
+# OpenCV / models (sensitive + environment-specific)
+data/lbph_model.yml
+data/faces/**
+
+# Enrollment DB and any local state
+*.db
+access_control*.db
+
+# Packaged original binary (large; optional for this repo)
+*.jar
+
+# Windows / IDE
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+.cursor/
