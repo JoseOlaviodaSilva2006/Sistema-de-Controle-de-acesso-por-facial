@@ -3,6 +3,7 @@ import hashlib
 import os
 import sqlite3
 import time
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -10,592 +11,405 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
+# Configuração de Logs
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("AuraAuth")
 
-CASCADE_PATH = Path("data") / "haarcascade_frontalface_alt.xml"
-DB_PATH = Path("access_control_v2.db")
-MODEL_PATH = Path("data") / "lbph_model.yml"
+def load_env():
+    """Carregador simples de .env para evitar dependências extras se possível."""
+    env = {}
+    env_path = Path(".env")
+    if env_path.exists():
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.strip().split("=", 1)
+                    env[k.strip()] = v.strip()
+    return env
+
+_cfg = load_env()
+
+# --- CONSTANTES CONFIGURÁVEIS ---
+CASCADE_PATH = Path(_cfg.get("CASCADE_PATH", "data/haarcascade_frontalface_alt.xml"))
+DB_PATH = Path(_cfg.get("DB_PATH", "access_control_v2.db"))
+MODEL_PATH = Path(_cfg.get("MODEL_PATH", "data/lbph_model.yml"))
 FACE_SIZE = (160, 160)
 MIN_FACE_SIZE = (90, 90)
-REQUIRED_SAMPLES = 100
-CONFIDENCE_THRESHOLD = 95.0
+REQUIRED_SAMPLES = int(_cfg.get("REQUIRED_SAMPLES", 100))
+CONFIDENCE_THRESHOLD = float(_cfg.get("CONFIDENCE_THRESHOLD", 95.0))
 ACCESS_DENIED_SECONDS = 3.0
 ACCESS_GRANTED_SECONDS = 3.0
-REQUIRED_CONSISTENT_MATCHES = 3
-AUTO_UPDATE_MIN_INTERVAL_SECONDS = 20.0
-AUTO_RETRAIN_EVERY_NEW_SAMPLES = 10
+REQUIRED_CONSISTENT_MATCHES = int(_cfg.get("REQUIRED_CONSISTENT_MATCHES", 3))
 
-# Visual identity (BGR)
-COLOR_BG = (18, 22, 28)
-COLOR_SURFACE = (30, 38, 48)
-COLOR_SURFACE_SOFT = (38, 47, 58)
-COLOR_PRIMARY = (255, 173, 64)
-COLOR_TEXT = (240, 240, 240)
-COLOR_TEXT_MUTED = (185, 195, 205)
-COLOR_SUCCESS = (72, 191, 117)
+# Cores Aura (BGR)
+COLOR_SUCCESS = (117, 191, 72)
 COLOR_DANGER = (80, 80, 240)
-COLOR_INFO = (145, 205, 255)
-
+COLOR_INFO = (255, 173, 64)
+COLOR_PRIMARY = (64, 173, 255)
 
 @dataclass
 class User:
     id: int
     name: str
     active: int = 1
-
+    created_at: str = ""
 
 class Storage:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
+        try:
+            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._init_db()
+        except sqlite3.Error as e:
+            logger.error(f"Erro ao conectar ao banco de dados: {e}")
+            raise
 
     def _init_db(self) -> None:
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL UNIQUE,
-                    active INTEGER NOT NULL DEFAULT 1,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS face_samples (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    image_path TEXT NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY(user_id) REFERENCES users(id)
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS auth_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    event_type TEXT NOT NULL,
-                    confidence REAL,
-                    details TEXT,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS admins (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    username TEXT NOT NULL UNIQUE,
-                    password_hash TEXT NOT NULL,
-                    active INTEGER NOT NULL DEFAULT 1,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
+        try:
+            with self.conn:
+                self.conn.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+                self.conn.execute("CREATE TABLE IF NOT EXISTS face_samples (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, image_path TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(user_id) REFERENCES users(id))")
+                self.conn.execute("CREATE TABLE IF NOT EXISTS auth_events (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, event_type TEXT NOT NULL, confidence REAL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+                self.conn.execute("CREATE TABLE IF NOT EXISTS admins (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, salt TEXT, active INTEGER NOT NULL DEFAULT 1)")
+                
+                # Migração: Adicionar coluna 'salt' se não existir
+                cursor = self.conn.execute("PRAGMA table_info(admins)")
+                cols = [row[1] for row in cursor.fetchall()]
+                if "salt" not in cols:
+                    self.conn.execute("ALTER TABLE admins ADD COLUMN salt TEXT")
+        except sqlite3.Error as e:
+            logger.error(f"Erro ao inicializar tabelas: {e}")
 
-    def upsert_user(self, name: str) -> User:
-        with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute(
-                "SELECT id, name, active FROM users WHERE name = ? LIMIT 1", (name,)
-            ).fetchone()
-            if row:
-                return User(id=row[0], name=row[1], active=row[2])
-            cursor = conn.execute("INSERT INTO users(name) VALUES (?)", (name,))
-            return User(id=cursor.lastrowid, name=name, active=1)
-
-    def user_by_id(self, user_id: int) -> Optional[User]:
-        with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute(
-                "SELECT id, name FROM users WHERE id = ? AND active = 1 LIMIT 1", (user_id,)
-            ).fetchone()
-            if not row:
-                return None
-            return User(id=row[0], name=row[1], active=1)
-
-    def user_by_id_any(self, user_id: int) -> Optional[User]:
-        with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute(
-                "SELECT id, name, active FROM users WHERE id = ? LIMIT 1", (user_id,)
-            ).fetchone()
-            if not row:
-                return None
-            return User(id=row[0], name=row[1], active=row[2])
+    def __del__(self):
+        try: 
+            if hasattr(self, 'conn'): self.conn.close()
+        except Exception: pass
 
     def list_users(self) -> List[User]:
-        with sqlite3.connect(self.db_path) as conn:
-            rows = conn.execute(
-                "SELECT id, name, active FROM users ORDER BY id"
-            ).fetchall()
-            return [User(id=r[0], name=r[1], active=r[2]) for r in rows]
+        try:
+            rows = self.conn.execute("SELECT id, name, active, created_at FROM users ORDER BY id DESC").fetchall()
+            return [User(id=r[0], name=r[1], active=r[2], created_at=r[3]) for r in rows]
+        except sqlite3.Error as e:
+            logger.error(f"Erro ao listar usuários: {e}")
+            return []
 
-    def create_user(self, name: str, active: int = 1) -> User:
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute(
-                "INSERT INTO users(name, active) VALUES (?, ?)",
-                (name.strip(), int(active)),
-            )
-            return User(id=cursor.lastrowid, name=name.strip(), active=int(active))
-
-    def update_user(self, user_id: int, name: str) -> None:
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                "UPDATE users SET name = ? WHERE id = ?",
-                (name.strip(), user_id),
-            )
+    def create_user(self, name: str) -> User:
+        # Sanitização de entrada (Whitelist de caracteres)
+        clean_name = "".join([c for c in name.strip() if c.isalnum() or c in (" ", "-", "_")])
+        if not clean_name: raise ValueError("Nome de usuário contém apenas caracteres proibidos ou está vazio.")
+        
+        try:
+            with self.conn:
+                cursor = self.conn.execute("INSERT INTO users(name) VALUES (?)", (clean_name,))
+                return User(id=cursor.lastrowid, name=clean_name)
+        except sqlite3.IntegrityError:
+            raise ValueError(f"O usuário '{clean_name}' já existe.")
+        except sqlite3.Error as e:
+            logger.error(f"Erro ao criar usuário: {e}")
+            raise
 
     def set_user_active(self, user_id: int, active: int) -> None:
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                "UPDATE users SET active = ? WHERE id = ?",
-                (int(active), user_id),
-            )
+        try:
+            with self.conn:
+                self.conn.execute("UPDATE users SET active = ? WHERE id = ?", (active, user_id))
+        except sqlite3.Error as e:
+            logger.error(f"Erro ao atualizar status do usuário: {e}")
+
+    def delete_user(self, user_id: int) -> None:
+        try:
+            # Pegar caminhos das fotos para deletar fisicamente
+            paths = self.conn.execute("SELECT image_path FROM face_samples WHERE user_id = ?", (user_id,)).fetchall()
+            with self.conn:
+                self.conn.execute("DELETE FROM face_samples WHERE user_id = ?", (user_id,))
+                self.conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            
+            for (p,) in paths:
+                if os.path.exists(p): os.remove(p)
+        except Exception as e:
+            logger.error(f"Erro ao deletar usuário: {e}")
 
     def add_sample(self, user_id: int, image_path: str) -> None:
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                "INSERT INTO face_samples(user_id, image_path) VALUES (?, ?)",
-                (user_id, image_path),
-            )
+        try:
+            with self.conn:
+                self.conn.execute("INSERT INTO face_samples(user_id, image_path) VALUES (?, ?)", (user_id, image_path))
+                
+                rows = self.conn.execute("SELECT id, image_path FROM face_samples WHERE user_id = ? ORDER BY id ASC", (user_id,)).fetchall()
+                if len(rows) > REQUIRED_SAMPLES:
+                    to_delete = rows[:len(rows) - REQUIRED_SAMPLES]
+                    for sample_id, path in to_delete:
+                        if os.path.exists(path):
+                            try: os.remove(path)
+                            except OSError: pass
+                        self.conn.execute("DELETE FROM face_samples WHERE id = ?", (sample_id,))
+        except sqlite3.Error as e:
+            logger.error(f"Erro ao gerenciar amostras: {e}")
 
     def get_all_samples(self) -> List[Tuple[int, str]]:
-        with sqlite3.connect(self.db_path) as conn:
-            return conn.execute(
-                """
-                SELECT fs.user_id, fs.image_path
-                FROM face_samples fs
-                JOIN users u ON u.id = fs.user_id
-                WHERE u.active = 1
-                ORDER BY fs.id
-                """
-            ).fetchall()
+        try:
+            return self.conn.execute("SELECT fs.user_id, fs.image_path FROM face_samples fs JOIN users u ON u.id = fs.user_id WHERE u.active = 1").fetchall()
+        except sqlite3.Error: return []
 
-    def get_user_samples(self, user_id: int) -> List[str]:
-        with sqlite3.connect(self.db_path) as conn:
-            rows = conn.execute(
-                "SELECT image_path FROM face_samples WHERE user_id = ? ORDER BY id DESC",
-                (user_id,),
-            ).fetchall()
-            return [r[0] for r in rows]
+    def user_by_id(self, uid):
+        try:
+            row = self.conn.execute("SELECT id, name, active FROM users WHERE id = ?", (uid,)).fetchone()
+            return User(id=row[0], name=row[1], active=row[2]) if row else None
+        except sqlite3.Error: return None
 
-    @staticmethod
-    def _hash_password(password: str) -> str:
-        # PBKDF2-HMAC with static app salt for local desktop use.
-        salt = b"facial-auth-v2-admin-salt"
-        digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
-        return digest.hex()
+    def log_event(self, event_type: str, user_id: Optional[int] = None, confidence: Optional[float] = None) -> None:
+        try:
+            with self.conn:
+                self.conn.execute("INSERT INTO auth_events(user_id, event_type, confidence) VALUES (?, ?, ?)", (user_id, event_type, confidence))
+        except sqlite3.Error as e:
+            logger.warning(f"Falha ao registrar log no banco: {e}")
 
-    def ensure_default_admin(self, username: str, password: str) -> None:
-        with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute("SELECT id FROM admins LIMIT 1").fetchone()
-            if row:
-                return
-            conn.execute(
-                "INSERT INTO admins(username, password_hash, active) VALUES (?, ?, 1)",
-                (username, self._hash_password(password)),
-            )
+    def get_logs(self, limit: int = 50) -> List[dict]:
+        try:
+            rows = self.conn.execute("SELECT e.event_type, u.name, e.confidence, e.created_at FROM auth_events e LEFT JOIN users u ON e.user_id = u.id ORDER BY e.id DESC LIMIT ?", (limit,)).fetchall()
+            return [{"type": r[0], "user": r[1] or "---", "conf": r[2] or 0.0, "time": r[3]} for r in rows]
+        except sqlite3.Error: return []
 
-    def verify_admin(self, username: str, password: str) -> bool:
-        with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute(
-                "SELECT password_hash, active FROM admins WHERE username = ? LIMIT 1",
-                (username.strip(),),
-            ).fetchone()
-            if not row:
+    def _hash(self, password: str, salt: Optional[str] = None) -> Tuple[str, str]:
+        if salt is None:
+            salt_bytes = os.urandom(16)
+        else:
+            try: salt_bytes = bytes.fromhex(salt)
+            except ValueError: salt_bytes = os.urandom(16) # Fallback seguro
+            
+        digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt_bytes, 200_000)
+        return digest.hex(), salt_bytes.hex()
+    
+    def verify_admin(self, u, p):
+        try:
+            row = self.conn.execute("SELECT password_hash, salt FROM admins WHERE username = ? AND active = 1", (u.strip(),)).fetchone()
+            if not row: return False
+            
+            stored_hash, stored_salt = row
+            if not stored_salt:
+                old_salt = b"facial-auth-v2-admin-salt"
+                old_digest = hashlib.pbkdf2_hmac("sha256", p.encode("utf-8"), old_salt, 200_000).hex()
+                if old_digest == stored_hash:
+                    new_h, new_s = self._hash(p)
+                    with self.conn:
+                        self.conn.execute("UPDATE admins SET password_hash = ?, salt = ? WHERE username = ?", (new_h, new_s, u.strip()))
+                    return True
                 return False
-            if int(row[1]) != 1:
-                return False
-            return self._hash_password(password) == row[0]
+                
+            h, _ = self._hash(p, stored_salt)
+            return h == stored_hash
+        except Exception as e:
+            logger.error(f"Erro na verificação admin: {e}")
+            return False
 
-    def create_admin(self, username: str, password: str) -> None:
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                "INSERT INTO admins(username, password_hash, active) VALUES (?, ?, 1)",
-                (username.strip(), self._hash_password(password)),
-            )
+    def create_admin(self, u, p):
+        try:
+            h, s = self._hash(p)
+            with self.conn:
+                self.conn.execute("INSERT INTO admins(username, password_hash, salt) VALUES (?, ?, ?)", (u.strip(), h, s))
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"Erro ao criar admin: {e}")
+            return False
 
-    def log_event(
-        self,
-        event_type: str,
-        user_id: Optional[int] = None,
-        confidence: Optional[float] = None,
-        details: str = "",
-    ) -> None:
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                "INSERT INTO auth_events(user_id, event_type, confidence, details) VALUES (?, ?, ?, ?)",
-                (user_id, event_type, confidence, details),
-            )
+    def ensure_default_admin(self, u, p):
+        try:
+            if not self.conn.execute("SELECT id FROM admins LIMIT 1").fetchone():
+                self.create_admin(u, p)
+        except sqlite3.Error: pass
 
 
 class FaceEngine:
-    def __init__(self, cascade_path: Path, model_path: Path, storage: Storage) -> None:
-        if not cascade_path.exists():
-            raise FileNotFoundError(
-                f"Cascade file not found at {cascade_path}. Ensure OpenCV cascade XML exists."
-            )
+    def __init__(self, cascade_path: Path, model_path: Path, storage: Storage):
         self.cascade = cv2.CascadeClassifier(str(cascade_path))
-        if self.cascade.empty():
-            raise RuntimeError(f"Failed to load cascade from {cascade_path}")
-
-        if not hasattr(cv2, "face") or not hasattr(cv2.face, "LBPHFaceRecognizer_create"):
-            raise RuntimeError(
-                "OpenCV contrib module not found. Install opencv-contrib-python."
-            )
         self.recognizer = cv2.face.LBPHFaceRecognizer_create(radius=2, neighbors=12, grid_x=8, grid_y=8)
         self.model_path = model_path
         self.storage = storage
-        self.model_path.parent.mkdir(parents=True, exist_ok=True)
         self.model_ready = False
         self.try_load_model()
 
-    def try_load_model(self) -> None:
+    def try_load_model(self):
         if self.model_path.exists():
-            self.recognizer.read(str(self.model_path))
-            self.model_ready = True
+            try:
+                self.recognizer.read(str(self.model_path))
+                self.model_ready = True
+            except: self.model_ready = False
 
-    def detect_primary_face(self, frame: np.ndarray) -> Optional[np.ndarray]:
+    def detect_face(self, frame):
+        # Lógica de detecção idêntica à original
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = self.cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=MIN_FACE_SIZE,
-            flags=cv2.CASCADE_SCALE_IMAGE,
-        )
-        if len(faces) == 0:
-            return None
-        x, y, w, h = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)[0]
-        face = gray[y : y + h, x : x + w]
-        face = cv2.resize(face, FACE_SIZE, interpolation=cv2.INTER_AREA)
-        # Normalize contrast to reduce lighting sensitivity and improve LBPH stability.
-        face = cv2.equalizeHist(face)
-        return face
+        faces = self.cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=MIN_FACE_SIZE)
+        if len(faces) == 0: return None, None
+        # Pega a maior face
+        rect = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)[0]
+        x, y, w, h = rect
+        face_roi = gray[y:y+h, x:x+w]
+        face_roi = cv2.resize(face_roi, FACE_SIZE, interpolation=cv2.INTER_AREA)
+        face_roi = cv2.equalizeHist(face_roi)
+        return rect, face_roi
 
-    def train_from_db(self) -> bool:
+    def train_from_db(self):
         samples = self.storage.get_all_samples()
-        if not samples:
-            self.model_ready = False
-            return False
-
-        images: List[np.ndarray] = []
-        labels: List[int] = []
-        for user_id, image_path in samples:
-            if not os.path.exists(image_path):
-                continue
-            img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-            if img is None:
-                continue
-            img = cv2.resize(img, FACE_SIZE, interpolation=cv2.INTER_AREA)
-            images.append(img)
-            labels.append(user_id)
-
-        if not images:
-            self.model_ready = False
-            return False
-
+        if not samples: return False
+        images, labels = [], []
+        for uid, path in samples:
+            img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            if img is not None:
+                images.append(cv2.resize(img, FACE_SIZE))
+                labels.append(uid)
+        if not images: return False
         self.recognizer.train(images, np.array(labels))
         self.recognizer.save(str(self.model_path))
         self.model_ready = True
         return True
 
-    def predict(self, face_gray: np.ndarray) -> Tuple[int, float]:
-        if not self.model_ready:
-            raise RuntimeError("Model not trained yet.")
-        label, confidence = self.recognizer.predict(face_gray)
-        return int(label), float(confidence)
+    def predict(self, face_gray):
+        if not self.model_ready: return -1, 999.0
+        return self.recognizer.predict(face_gray)
+
+class AuthController:
+    def __init__(self, engine, storage):
+        self.engine = engine
+        self.storage = storage
+        self.denied_until = 0.0
+        self.granted_until = 0.0
+        self.granted_name = ""
+        self.consecutive = 0
+        self.last_id = None
+        self.last_update_at = {} 
+        
+        # Liveness check (Vivacidade)
+        self.face_history = [] # Armazena ROIs das últimas faces para checar movimento/mudança
+
+    def _check_liveness(self, current_roi):
+        """Checa se a face não é uma foto estática verificando variação de pixels."""
+        if current_roi is None: return False
+        
+        # Reduzir ruído
+        current_roi = cv2.GaussianBlur(current_roi, (5, 5), 0)
+        
+        is_alive = True
+        if len(self.face_history) > 0:
+            last_roi = self.face_history[-1]
+            try:
+                # Calcula diferença absoluta entre os frames
+                diff = cv2.absdiff(last_roi, current_roi)
+                score = np.sum(diff) / (current_roi.size)
+                
+                # Tolerância mais generosa para evitar falsos negativos ou travamentos.
+                is_alive = 0.1 < score < 80.0 
+            except Exception:
+                is_alive = True
+            
+        self.face_history.append(current_roi)
+        if len(self.face_history) > 10: self.face_history.pop(0)
+        return is_alive
+
+    def process(self, frame):
+        now = time.time()
+        rect, face_gray = self.engine.detect_face(frame)
+        
+        label, detail, color = "SISTEMA ATIVO", "Aguardando detecção facial...", COLOR_INFO
+
+        if now < self.granted_until:
+            label, detail, color = "ACESSO LIBERADO", f"Bem-vindo, {self.granted_name}", COLOR_SUCCESS
+            VisualHelper.draw_glow(frame, COLOR_SUCCESS)
+        elif now < self.denied_until:
+            label, detail, color = "ACESSO NEGADO", "Usuário não reconhecido ou inativo", COLOR_DANGER
+            VisualHelper.draw_glow(frame, COLOR_DANGER)
+        elif rect is not None:
+            # Check de Vivacidade
+            if not self._check_liveness(face_gray):
+                label, detail, color = "VIVACIDADE FALHOU", "Mantenha-se estável e olhe para a câmera", COLOR_INFO
+                VisualHelper.draw_hud(frame, rect, label, detail, color)
+                return frame
+
+            uid, conf = self.engine.predict(face_gray)
+            
+            if conf <= CONFIDENCE_THRESHOLD:
+                if self.last_id == uid: self.consecutive += 1
+                else: self.last_id, self.consecutive = uid, 1
+                
+                if self.consecutive >= REQUIRED_CONSISTENT_MATCHES:
+                    user = self.storage.user_by_id(uid)
+                    if user and user.active:
+                        self.granted_until, self.granted_name = now + ACCESS_GRANTED_SECONDS, user.name
+                        self.storage.log_event("verify_granted", user_id=user.id, confidence=conf)
+                        
+                        # --- AUTO-UPDATE: SALVAR FOTO DO ACESSO ---
+                        last_upd = self.last_update_at.get(user.id, 0.0)
+                        if now - last_upd > 20.0: 
+                            p = Path(f"data/faces/{user.id}")
+                            p.mkdir(parents=True, exist_ok=True)
+                            fname = p / f"auto_{time.time_ns()}.jpg"
+                            cv2.imwrite(str(fname), face_gray, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                            self.storage.add_sample(user.id, str(fname))
+                            self.last_update_at[user.id] = now
+                    else:
+                        self.denied_until = now + ACCESS_DENIED_SECONDS
+                        self.storage.log_event("verify_denied", user_id=uid)
+
+                        denied_dir = Path("data/denied")
+                        denied_dir.mkdir(parents=True, exist_ok=True)
+                        fname = denied_dir / f"denied_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
+                        cv2.imwrite(str(fname), frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    self.consecutive = 0
+                else:
+                    label, detail = "VALIDANDO...", f"Analisando biometria [{self.consecutive}/{REQUIRED_CONSISTENT_MATCHES}]"
+            else:
+                self.consecutive = 0
+                if now > self.denied_until + 5.0: 
+                    self.denied_until = now + ACCESS_DENIED_SECONDS
+                    self.storage.log_event("verify_unknown", details="low_confidence")
+                    denied_dir = Path("data/denied")
+                    denied_dir.mkdir(parents=True, exist_ok=True)
+                    fname = denied_dir / f"unknown_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
+                    cv2.imwrite(str(fname), frame, [cv2.IMWRITE_JPEG_QUALITY, 80])        
+        VisualHelper.draw_hud(frame, rect, label, detail, color)
+        return frame
 
 
-def _open_camera(index: int = 0) -> cv2.VideoCapture:
+class VisualHelper:
+    @staticmethod
+    def draw_glow(frame, color):
+        h, w = frame.shape[:2]
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (w, h), color, 30)
+        cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
+
+    @staticmethod
+    def draw_hud(frame, rect, label, detail, color):
+        if rect is not None:
+            x, y, w, h = rect
+            l, t = 30, 3
+            cv2.line(frame, (x, y), (x+l, y), color, t)
+            cv2.line(frame, (x, y), (x, y+l), color, t)
+            cv2.line(frame, (x+w, y), (x+w-l, y), color, t)
+            cv2.line(frame, (x+w, y), (x+w, y+l), color, t)
+            cv2.line(frame, (x, y+h), (x+l, y+h), color, t)
+            cv2.line(frame, (x, y+h), (x, y+h-l), color, t)
+            cv2.line(frame, (x+w, y+h), (x+w-l, y+h), color, t)
+            cv2.line(frame, (x+w, y+h), (x+w, y+h-l), color, t)
+
+        hf, wf = frame.shape[:2]
+        # Overlay de Status (Original Style mas HUD Moderno)
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, hf-100), (wf, hf), (15, 23, 42), -1)
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+        cv2.rectangle(frame, (0, hf-100), (10, hf), color, -1)
+        cv2.putText(frame, label, (30, hf-60), cv2.FONT_HERSHEY_DUPLEX, 1.0, (255,255,255), 2)
+        cv2.putText(frame, detail, (30, hf-25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180,180,180), 1)
+
+def _open_camera(index=0):
     cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
     if not cap.isOpened():
-        cap = cv2.VideoCapture(index)
+        cap.release()
+        cap = cv2.VideoCapture(index, cv2.CAP_MSMF)
     if not cap.isOpened():
-        raise RuntimeError("Unable to access camera.")
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        cap.release()
+        cap = cv2.VideoCapture(index)
+    
+    if cap.isOpened():
+        # Apenas tenta definir a resolução. O _cam_loop cuidará do aquecimento (warm-up)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    
     return cap
-
-
-def _draw_panel(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int, color: Tuple[int, int, int], alpha: float) -> None:
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
-    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
-
-
-def _draw_header(frame: np.ndarray, title: str, subtitle: str) -> None:
-    width = frame.shape[1]
-    _draw_panel(frame, 0, 0, width, 110, COLOR_BG, 0.72)
-    cv2.putText(frame, title, (24, 44), cv2.FONT_HERSHEY_DUPLEX, 1.0, COLOR_TEXT, 2, cv2.LINE_AA)
-    cv2.putText(frame, subtitle, (24, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.65, COLOR_TEXT_MUTED, 2, cv2.LINE_AA)
-
-
-def _draw_footer(frame: np.ndarray, hint: str) -> None:
-    height, width = frame.shape[:2]
-    _draw_panel(frame, 0, height - 56, width, height, COLOR_BG, 0.66)
-    cv2.putText(frame, hint, (24, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.58, COLOR_TEXT_MUTED, 2, cv2.LINE_AA)
-
-
-def _draw_progress(frame: np.ndarray, saved: int, total: int) -> None:
-    width = frame.shape[1]
-    _draw_panel(frame, 24, 128, width - 24, 188, COLOR_SURFACE, 0.84)
-
-    percent = 0.0 if total <= 0 else min(1.0, saved / float(total))
-    bar_x1, bar_y1, bar_x2, bar_y2 = 40, 160, width - 40, 176
-    cv2.rectangle(frame, (bar_x1, bar_y1), (bar_x2, bar_y2), COLOR_SURFACE_SOFT, -1)
-    fill_x = int(bar_x1 + (bar_x2 - bar_x1) * percent)
-    cv2.rectangle(frame, (bar_x1, bar_y1), (fill_x, bar_y2), COLOR_PRIMARY, -1)
-
-    cv2.putText(
-        frame,
-        f"Enrollment Progress  {saved}/{total}",
-        (40, 150),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        COLOR_TEXT,
-        2,
-        cv2.LINE_AA,
-    )
-
-
-def _draw_status_badge(frame: np.ndarray, label: str, detail: str, color: Tuple[int, int, int]) -> None:
-    width = frame.shape[1]
-    _draw_panel(frame, 24, 128, width - 24, 210, COLOR_SURFACE, 0.88)
-    cv2.circle(frame, (52, 166), 12, color, -1)
-    cv2.putText(frame, label, (78, 172), cv2.FONT_HERSHEY_DUPLEX, 0.9, COLOR_TEXT, 2, cv2.LINE_AA)
-    cv2.putText(frame, detail, (78, 198), cv2.FONT_HERSHEY_SIMPLEX, 0.58, COLOR_TEXT_MUTED, 2, cv2.LINE_AA)
-
-
-def enroll(user_name: str) -> None:
-    storage = Storage(DB_PATH)
-    user = storage.upsert_user(user_name.strip())
-    engine = FaceEngine(CASCADE_PATH, MODEL_PATH, storage)
-    samples_dir = Path("data") / "faces" / str(user.id)
-    samples_dir.mkdir(parents=True, exist_ok=True)
-
-    cap = _open_camera(0)
-    saved = 0
-
-    print(f"Enrolling user '{user.name}' (id={user.id})...")
-    print("Look at the camera. Press 'q' to cancel.")
-
-    try:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                continue
-
-            frame = cv2.flip(frame, 1)
-            face = engine.detect_primary_face(frame)
-            if face is not None:
-                sample_file = samples_dir / f"{time.time_ns()}.jpg"
-                # JPEG reduces disk IO vs PNG and allows faster burst capture.
-                cv2.imwrite(str(sample_file), face, [cv2.IMWRITE_JPEG_QUALITY, 88])
-                storage.add_sample(user.id, str(sample_file))
-                saved += 1
-
-            _draw_header(
-                frame,
-                "Enrollment",
-                f"User: {user.name}  |  Capture consistent angles for best accuracy",
-            )
-            _draw_progress(frame, saved, REQUIRED_SAMPLES)
-            _draw_footer(frame, "Press q to cancel enrollment")
-            cv2.imshow("Enrollment", frame)
-
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                break
-            if saved >= REQUIRED_SAMPLES:
-                break
-
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
-
-    if saved < REQUIRED_SAMPLES:
-        print(f"Enrollment cancelled/incomplete: collected {saved}/{REQUIRED_SAMPLES}")
-        storage.log_event("enroll_incomplete", user_id=user.id, details=f"samples={saved}")
-        return
-
-    if engine.train_from_db():
-        print("Enrollment complete. Model retrained successfully.")
-        storage.log_event("enroll_success", user_id=user.id, details=f"samples={saved}")
-    else:
-        print("Enrollment saved, but model training failed.")
-        storage.log_event("enroll_training_failed", user_id=user.id, details=f"samples={saved}")
-
-
-def verify() -> None:
-    storage = Storage(DB_PATH)
-    engine = FaceEngine(CASCADE_PATH, MODEL_PATH, storage)
-
-    if not engine.model_ready:
-        retrained = engine.train_from_db()
-        if not retrained:
-            raise RuntimeError("No trained model and no samples found. Enroll users first.")
-
-    cap = _open_camera(0)
-    denied_until = 0.0
-    granted_until = 0.0
-    granted_user_name = ""
-    granted_confidence = 0.0
-    consecutive_match_count = 0
-    last_matched_user_id: Optional[int] = None
-    last_auto_update_at: dict[int, float] = {}
-    pending_auto_samples = 0
-
-    print("Verification started. Press 'q' to quit.")
-
-    try:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                continue
-            frame = cv2.flip(frame, 1)
-            now = time.time()
-
-            status_text = "Scanning..."
-            status_color = COLOR_INFO
-            status_detail = "Align your face inside the camera view"
-
-            if now < granted_until:
-                status_text = f"Access Granted: {granted_user_name}"
-                status_color = COLOR_SUCCESS
-                remaining = max(0.0, granted_until - now)
-                status_detail = (
-                    f"Verified successfully ({granted_confidence:.1f}). "
-                    f"Returning to scan in {remaining:.1f}s"
-                )
-            elif now < denied_until:
-                # Non-blocking denial window: camera loop keeps running while showing denial status.
-                status_text = "Access Denied"
-                status_color = COLOR_DANGER
-                remaining = max(0.0, denied_until - now)
-                status_detail = f"Validation failed. Resuming scan in {remaining:.1f}s"
-            else:
-                face = engine.detect_primary_face(frame)
-                if face is not None:
-                    label, confidence = engine.predict(face)
-                    user_any = storage.user_by_id_any(label)
-                    user = user_any if user_any and user_any.active == 1 else None
-
-                    if user_any and confidence <= CONFIDENCE_THRESHOLD:
-                        if last_matched_user_id == user_any.id:
-                            consecutive_match_count += 1
-                        else:
-                            last_matched_user_id = user_any.id
-                            consecutive_match_count = 1
-
-                        if consecutive_match_count >= REQUIRED_CONSISTENT_MATCHES:
-                            # Keep user profile updated with real verification captures.
-                            user_samples_dir = Path("data") / "faces" / str(user_any.id)
-                            user_samples_dir.mkdir(parents=True, exist_ok=True)
-                            last_update = last_auto_update_at.get(user_any.id, 0.0)
-                            if now - last_update >= AUTO_UPDATE_MIN_INTERVAL_SECONDS:
-                                auto_sample_file = user_samples_dir / f"verify_{time.time_ns()}.jpg"
-                                cv2.imwrite(
-                                    str(auto_sample_file),
-                                    face,
-                                    [cv2.IMWRITE_JPEG_QUALITY, 90],
-                                )
-                                storage.add_sample(user_any.id, str(auto_sample_file))
-                                last_auto_update_at[user_any.id] = now
-                                pending_auto_samples += 1
-                                # Retrain periodically to avoid heavy cost every single success.
-                                if pending_auto_samples >= AUTO_RETRAIN_EVERY_NEW_SAMPLES:
-                                    if engine.train_from_db():
-                                        pending_auto_samples = 0
-
-                            if user and user.active == 1:
-                                status_text = f"Access Granted: {user.name}"
-                                status_color = COLOR_SUCCESS
-                                status_detail = f"Verified ({confidence:.1f}) with stable multi-frame match"
-                                granted_user_name = user.name
-                                granted_confidence = confidence
-                                granted_until = now + ACCESS_GRANTED_SECONDS
-                                storage.log_event(
-                                    "verify_granted",
-                                    user_id=user.id,
-                                    confidence=confidence,
-                                    details=f"lbph_stable_match_{consecutive_match_count}_auto_update",
-                                )
-                            else:
-                                status_text = "Access Denied"
-                                status_color = COLOR_DANGER
-                                status_detail = (
-                                    f"User inactive ({user_any.name}) - updates saved, access blocked"
-                                )
-                                denied_until = now + ACCESS_DENIED_SECONDS
-                                storage.log_event(
-                                    "verify_denied_inactive",
-                                    user_id=user_any.id,
-                                    confidence=confidence,
-                                    details="matched_but_inactive_auto_updated",
-                                )
-                            consecutive_match_count = 0
-                            last_matched_user_id = None
-                        else:
-                            status_text = "Validating..."
-                            status_color = COLOR_INFO
-                            status_detail = (
-                                f"Potential match {user_any.name} ({confidence:.1f}) "
-                                f"[{consecutive_match_count}/{REQUIRED_CONSISTENT_MATCHES}]"
-                            )
-                    else:
-                        status_text = "Access Denied"
-                        status_color = COLOR_DANGER
-                        status_detail = f"Not recognized or low confidence (score={confidence:.1f})"
-                        denied_until = now + ACCESS_DENIED_SECONDS
-                        consecutive_match_count = 0
-                        last_matched_user_id = None
-                        storage.log_event(
-                            "verify_denied",
-                            user_id=label if user else None,
-                            confidence=confidence,
-                            details="threshold_or_unknown",
-                        )
-
-            _draw_header(frame, "Facial Verification", "Real-time access control pipeline")
-            _draw_status_badge(frame, status_text, status_detail, status_color)
-            _draw_footer(frame, "Press q to quit")
-            cv2.imshow("Facial Verification", frame)
-
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                break
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Facial authentication v2 (upgraded, non-blocking verification pipeline)."
-    )
-    sub = parser.add_subparsers(dest="cmd", required=True)
-
-    enroll_cmd = sub.add_parser("enroll", help="Enroll a user face profile")
-    enroll_cmd.add_argument("--name", required=True, help="Unique display name")
-
-    sub.add_parser("verify", help="Start live verification")
-    sub.add_parser("retrain", help="Retrain model from stored samples")
-
-    args = parser.parse_args()
-    if args.cmd == "enroll":
-        enroll(args.name)
-    elif args.cmd == "verify":
-        verify()
-    elif args.cmd == "retrain":
-        storage = Storage(DB_PATH)
-        engine = FaceEngine(CASCADE_PATH, MODEL_PATH, storage)
-        if engine.train_from_db():
-            print("Model retrained.")
-        else:
-            print("No samples found to retrain.")
-
-
-if __name__ == "__main__":
-    main()
