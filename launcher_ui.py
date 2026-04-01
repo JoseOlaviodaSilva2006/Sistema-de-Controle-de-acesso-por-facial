@@ -11,6 +11,7 @@ from facial_auth_v2 import (
     Storage, FaceEngine, AuthController, DB_PATH, CASCADE_PATH, 
     MODEL_PATH, REQUIRED_SAMPLES, COLOR_PRIMARY, _open_camera
 )
+from secure_storage import secure_io
 
 ctk.set_appearance_mode("Dark")
 
@@ -188,8 +189,8 @@ class App(ctk.CTk):
                 if getattr(self, 'is_enrolling', False):
                     rect, face_gray = self.engine.detect_face(frame)
                     if rect is not None and face_gray is not None:
-                        fname = self.enroll_data["dir"] / f"{time.time_ns()}.jpg"
-                        cv2.imwrite(str(fname), face_gray, [cv2.IMWRITE_JPEG_QUALITY, 88])
+                        fname = self.enroll_data["dir"] / f"{time.time_ns()}.enc"
+                        secure_io.save_encrypted_image(face_gray, str(fname), quality=88)
                         self.storage.add_sample(self.enroll_data['id'], str(fname))
                         self.enroll_data['count'] += 1
                         
@@ -343,7 +344,7 @@ class GalleryWindow(ctk.CTkToplevel):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
         
-        ctk.CTkLabel(self, text=f"Banco de Fotos: {name}", font=("Segoe UI", 16, "bold")).grid(row=0, column=0, pady=20)
+        ctk.CTkLabel(self, text=f"Banco de Fotos (Seguras): {name}", font=("Segoe UI", 16, "bold")).grid(row=0, column=0, pady=20)
         
         self.scroll = ctk.CTkScrollableFrame(self)
         self.scroll.grid(row=1, column=0, sticky="nsew", padx=20, pady=10)
@@ -353,7 +354,7 @@ class GalleryWindow(ctk.CTkToplevel):
         for widget in self.scroll.winfo_children(): widget.destroy()
         if not self.path.exists(): return
         
-        files = list(self.path.glob("*.jpg"))
+        files = list(self.path.glob("*.enc"))
         for i, f in enumerate(files):
             frame = ctk.CTkFrame(self.scroll)
             frame.pack(fill="x", pady=5, padx=5)
@@ -363,9 +364,12 @@ class GalleryWindow(ctk.CTkToplevel):
             ctk.CTkButton(frame, text="Excluir", width=60, fg_color="#991b1b", command=lambda p=f: self._del_img(p)).pack(side="right", padx=5)
 
     def _view_img(self, path):
-        img = cv2.imread(str(path))
-        cv2.imshow("Amostra Biometrica", img)
-        cv2.waitKey(1)
+        img = secure_io.load_decrypted_image(str(path))
+        if img is not None:
+            cv2.imshow("Amostra Biometrica Segura", img)
+            cv2.waitKey(1)
+        else:
+            messagebox.showerror("Erro", "Falha ao decriptar a imagem. A chave pode estar incorreta.")
 
     def _del_img(self, path):
         if messagebox.askyesno("Confirmar", "Excluir esta foto?"):
