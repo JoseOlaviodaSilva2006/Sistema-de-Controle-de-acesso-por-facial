@@ -3,6 +3,7 @@ import hashlib
 import os
 import sqlite3
 import time
+import datetime
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,11 +11,15 @@ from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
+import pytz
 from secure_storage import secure_io
 
 # Configuração de Logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("AuraAuth")
+
+def get_br_time():
+    return datetime.datetime.now(pytz.timezone('America/Sao_Paulo')).strftime('%Y-%m-%d %H:%M:%S')
 
 def load_env():
     """Carregador simples de .env para evitar dependências extras se possível."""

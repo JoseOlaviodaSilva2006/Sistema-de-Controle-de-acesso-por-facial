@@ -10,6 +10,9 @@ from pathlib import Path
 import csv
 import zipfile
 import shutil
+import re
+from validate_docbr import CPF
+import phonenumbers
 
 from facial_auth_v2 import (
     Storage, FaceEngine, AuthController, DB_PATH, CASCADE_PATH, 
@@ -19,18 +22,33 @@ from secure_storage import secure_io
 
 ctk.set_appearance_mode("Dark")
 
+# Utilitários de Validação e Formatação
+cpf_validator = CPF()
+
+def format_cpf(cpf_str):
+    cpf_str = re.sub(r'\D', '', cpf_str)
+    if len(cpf_str) == 11:
+        return f"{cpf_str[:3]}.{cpf_str[3:6]}.{cpf_str[6:9]}-{cpf_str[9:]}"
+    return cpf_str
+
+def format_phone(phone_str):
+    phone_str = re.sub(r'\D', '', phone_str)
+    if len(phone_str) == 11:
+        return f"({phone_str[:2]}) {phone_str[2:7]}-{phone_str[7:]}"
+    elif len(phone_str) == 10:
+        return f"({phone_str[:2]}) {phone_str[2:6]}-{phone_str[6:]}"
+    return phone_str
+
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("AURA ACCESS CONTROL v3")
+        self.title("AURA ACCESS CONTROL v3 - SECURE EDITION")
         self.geometry("1200x800")
         
-        # Backend e Configuração
         from facial_auth_v2 import load_env, logger
         self.cfg = load_env()
         self.storage = Storage(DB_PATH)
         
-        # Garante admin padrão do .env
         def_user = self.cfg.get("DEFAULT_ADMIN_USER", "admin")
         def_pwd = self.cfg.get("DEFAULT_ADMIN_PASSWORD", "admin123")
         self.storage.ensure_default_admin(def_user, def_pwd)
@@ -44,7 +62,6 @@ class App(ctk.CTk):
             self.destroy()
             return
         
-        # State Control
         self.cap = None
         self.is_cam_on = False
         self.is_enrolling = False
@@ -52,7 +69,6 @@ class App(ctk.CTk):
         self.enroll_data = {"id": None, "name": "", "count": 0, "dir": None}
         self.stop_event = threading.Event()
         
-        # Layout
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
         
@@ -71,7 +87,11 @@ class App(ctk.CTk):
         self.btn_users = self._nav_btn("USUÁRIOS", "users")
         self.btn_logs = self._nav_btn("HISTÓRICO", "logs")
         
-        self.admin_info = ctk.CTkLabel(self.sidebar, text="Status: Guest", font=("Segoe UI", 11), text_color="gray")
+        # Oculta botões sensíveis até logar
+        self.btn_users.pack_forget()
+        self.btn_logs.pack_forget()
+        
+        self.admin_info = ctk.CTkLabel(self.sidebar, text="", font=("Segoe UI", 12, "bold"), text_color="#16a34a")
         self.admin_info.pack(side="bottom", pady=(0, 10))
         
         self.btn_login = ctk.CTkButton(self.sidebar, text="LOGIN ADM", height=40, fg_color="#333", command=self._handle_auth_btn)
@@ -130,7 +150,7 @@ class App(ctk.CTk):
         self.f_logs = ctk.CTkFrame(self, fg_color="transparent")
         l_top = ctk.CTkFrame(self.f_logs, fg_color="transparent")
         l_top.pack(fill="x", padx=40, pady=(40, 20))
-        ctk.CTkLabel(l_top, text="Registro de Eventos", font=ctk.CTkFont(size=22, weight="bold")).pack(side="left")
+        ctk.CTkLabel(l_top, text="Registro de Eventos Criptografados", font=ctk.CTkFont(size=22, weight="bold")).pack(side="left")
         ctk.CTkButton(l_top, text="Exportar CSV", fg_color="#16a34a", command=self._export_logs).pack(side="right")
         
         self.log_list = tk.Listbox(self.f_logs, bg="#111", fg="#bbb", font=("Consolas", 11), border=0)
@@ -153,7 +173,6 @@ class App(ctk.CTk):
 
     def toggle_cam(self):
         if not self.is_cam_on:
-            # Garante que qualquer thread antiga morreu antes de abrir de novo
             if getattr(self, 'cam_thread', None) and self.cam_thread.is_alive():
                 self.stop_event.set()
                 self.cam_thread.join(timeout=1.0)
@@ -177,8 +196,6 @@ class App(ctk.CTk):
         self.is_enrolling = False
         self.is_training = False
         self.stop_event.set()
-        
-        # O _cam_loop fará o release do cap quando o while terminar para evitar conflito
         self.v_label.configure(image=None, text="CÂMERA OFFLINE")
         self.btn_cam.configure(text="ATIVAR SISTEMA", fg_color=ctk.ThemeManager.theme["CTkButton"]["fg_color"])
 
@@ -188,8 +205,7 @@ class App(ctk.CTk):
             ret, frame = self.cap.read()
             if not ret or frame is None:
                 fail_count += 1
-                if fail_count > 100:  # 5 segundos de tolerância
-                    print("Falha ao obter imagem do sensor. Desligando câmera.")
+                if fail_count > 100:
                     break
                 time.sleep(0.05)
                 continue
@@ -214,7 +230,7 @@ class App(ctk.CTk):
                                 try:
                                     self.engine.train_from_db()
                                     self.after(0, lambda: setattr(self, 'is_training', False))
-                                    self.after(0, lambda: self.admin_info.configure(text="Cadastro e Treinamento Concluídos!", text_color="#16a34a"))
+                                    self.after(0, lambda: messagebox.showinfo("Aura Access", "Cadastro Biométrico Seguro Concluído!"))
                                 except Exception as e:
                                     print("Erro no treinamento:", e)
                                 
@@ -224,37 +240,31 @@ class App(ctk.CTk):
                     VisualHelper.draw_hud(frame, rect, "CADASTRANDO", f"Capture: {self.enroll_data['count']}/{REQUIRED_SAMPLES}", COLOR_PRIMARY)
                 elif getattr(self, 'is_training', False):
                     from facial_auth_v2 import VisualHelper, COLOR_INFO
-                    VisualHelper.draw_hud(frame, None, "SISTEMA TREINANDO", "Processando novo modelo de IA...", COLOR_INFO)
+                    VisualHelper.draw_hud(frame, None, "SISTEMA TREINANDO", "Processando IA Segura...", COLOR_INFO)
                 else:
                     frame = self.auth_ctrl.process(frame)
             except Exception as e:
                 print(f"Erro no processamento do frame: {e}")
             
             try:
-                # Otimização e Segurança de Thread:
                 frame_resized = cv2.resize(frame, (800, 500))
                 img_pil = Image.fromarray(cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB))
                 
-                # CRÍTICO: CTkImage DEVE ser instanciado na Thread Principal, senão causa Deadlock no Tkinter!
                 def update_ui_safe(image):
                     if self.is_cam_on:
                         ctk_img = ctk.CTkImage(image, size=(800, 500))
                         self.v_label.configure(image=ctk_img, text="")
                 
                 self.after(0, update_ui_safe, img_pil)
-            except Exception as e:
-                print(f"Erro na Thread de UI: {e}")
+            except Exception:
                 pass
             
-            # Limita a taxa de atualização (cerca de 50fps) para não estrangular o Tkinter
             time.sleep(0.02)
             
-        # Quando o loop encerra (por stop_event ou erro), garantimos que solta a câmera
         if self.cap:
             self.cap.release()
             self.cap = None
             
-        # Garante que a UI reflete a queda da câmera se foi um erro interno e não um clique de usuário
         if self.is_cam_on and not self.stop_event.is_set():
             self.is_cam_on = False
             self.is_enrolling = False
@@ -265,29 +275,55 @@ class App(ctk.CTk):
     def _handle_auth_btn(self):
         if self.logged_admin:
             self.logged_admin = None
-            self.admin_info.configure(text="Status: Guest", text_color="gray")
+            self.admin_info.configure(text="")
             self.btn_login.configure(text="LOGIN ADM", fg_color="#333")
+            self.btn_users.pack_forget()
+            self.btn_logs.pack_forget()
+            self.select_frame("dash")
+            self.storage.log_event("admin_logout", details="Logout Efetuado")
             messagebox.showinfo("Aura", "Logout realizado.")
         else:
             self._show_login()
 
     def _show_login(self):
-        d = ctk.CTkInputDialog(text="Senha de Administrador:", title="Aura Security")
-        pwd = d.get_input()
-        if pwd and self.storage.verify_admin("admin", pwd):
-            self.logged_admin = "admin"
-            self.admin_info.configure(text="Status: Admin Autenticado", text_color="#16a34a")
-            self.btn_login.configure(text="LOGOUT", fg_color="#991b1b")
-        elif pwd: messagebox.showerror("Erro", "Senha incorreta.")
+        # Usando Janela Customizada para Login e Senha simultâneos e seguros
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Autenticação Admin")
+        dialog.geometry("400x300")
+        dialog.attributes("-topmost", True)
+        
+        ctk.CTkLabel(dialog, text="Acesso Restrito", font=("Segoe UI", 20, "bold")).pack(pady=20)
+        
+        u_entry = ctk.CTkEntry(dialog, width=300, placeholder_text="Login")
+        u_entry.pack(pady=10)
+        
+        p_entry = ctk.CTkEntry(dialog, width=300, placeholder_text="Senha", show="*")
+        p_entry.pack(pady=10)
+        
+        def _try_login():
+            u = u_entry.get().strip()
+            p = p_entry.get()
+            if u and p and self.storage.verify_admin(u, p):
+                self.logged_admin = u
+                self.admin_info.configure(text=f"ADMIN: {u.upper()}")
+                self.btn_login.configure(text="LOGOUT", fg_color="#991b1b")
+                self.btn_users.pack(fill="x", after=self.btn_dash)
+                self.btn_logs.pack(fill="x", after=self.btn_users)
+                self.storage.log_event("admin_login", details=f"Admin {u} logou")
+                dialog.destroy()
+            else:
+                messagebox.showerror("Erro", "Credenciais incorretas.")
+                self.storage.log_event("admin_login_failed", details=f"Tentativa com user: {u}")
+                
+        ctk.CTkButton(dialog, text="ENTRAR", command=_try_login).pack(pady=20)
 
     def _export_users(self):
         if not self.logged_admin: return messagebox.showwarning("ADM", "Login ADM necessário.")
-        save_path = filedialog.asksaveasfilename(defaultextension=".zip", filetypes=[("ZIP files", "*.zip")], title="Exportar Usuários")
+        save_path = filedialog.asksaveasfilename(defaultextension=".zip", filetypes=[("ZIP files", "*.zip")], title="Exportar Usuários Criptografados")
         if not save_path: return
         
         try:
             with zipfile.ZipFile(save_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                # Cria um CSV temporario com os usuários e adiciona ao zip
                 users = self.storage.list_users()
                 csv_path = "temp_users_export.csv"
                 with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
@@ -299,7 +335,6 @@ class App(ctk.CTk):
                 zipf.write(csv_path, arcname="usuarios_db.csv")
                 os.remove(csv_path)
                 
-                # Adiciona os rostos (encriptados)
                 faces_dir = Path("data/faces")
                 if faces_dir.exists():
                     for root, _, files in os.walk(faces_dir):
@@ -308,7 +343,8 @@ class App(ctk.CTk):
                             arcname = os.path.relpath(file_path, start="data")
                             zipf.write(file_path, arcname=arcname)
             
-            messagebox.showinfo("Exportar", f"Banco de usuários e biometria exportados com sucesso para:\n{save_path}")
+            self.storage.log_event("admin_export", details="Base de Usuários e Biometrias Exportada")
+            messagebox.showinfo("Exportar", f"Banco exportado com segurança.")
         except Exception as e:
             messagebox.showerror("Erro na Exportação", str(e))
 
@@ -318,22 +354,20 @@ class App(ctk.CTk):
         if not save_path: return
         
         try:
-            logs = self.storage.get_logs(limit=10000) # Busca histórico maior
+            logs = self.storage.get_logs(limit=10000)
             with open(save_path, 'w', newline='', encoding='utf-8') as csvfile:
                 writer = csv.writer(csvfile)
                 writer.writerow(["Data/Hora", "Evento", "Usuário", "Confiança"])
                 for log in logs:
                     writer.writerow([log['time'], log['type'].upper(), log['user'], f"{log['conf']:.2f}"])
-            messagebox.showinfo("Exportar", f"Histórico salvo em:\n{save_path}")
+            self.storage.log_event("admin_export", details="Log de Eventos Exportado")
+            messagebox.showinfo("Exportar", f"Histórico salvo com sucesso.")
         except Exception as e:
             messagebox.showerror("Erro", str(e))
 
     def _show_enroll(self):
         if not self.logged_admin: return messagebox.showwarning("ADM", "Login ADM necessário.")
-        if self.is_enrolling:
-            messagebox.showwarning("Aviso", "Já existe um cadastro em andamento.")
-            return
-
+        if self.is_enrolling: return messagebox.showwarning("Aviso", "Já existe um cadastro em andamento.")
         EnrollForm(self)
 
     def _edit_user(self):
@@ -342,7 +376,6 @@ class App(ctk.CTk):
         if not sel: return messagebox.showwarning("Seleção", "Selecione um usuário para editar.")
         
         uid = self.tree.item(sel[0])['values'][0]
-        # Encontra na lista de usuarios do banco
         users = self.storage.list_users()
         target = next((u for u in users if u.id == uid), None)
         
@@ -356,8 +389,7 @@ class App(ctk.CTk):
     def _import_users(self):
         if not self.logged_admin: return messagebox.showwarning("ADM", "Login ADM necessário.")
         
-        # Pede confirmação extra de segurança
-        d = ctk.CTkInputDialog(text="Digite a senha de ADMIN para confirmar a importação:", title="Segurança")
+        d = ctk.CTkInputDialog(text="Confirme sua senha de ADMIN para autorizar a importação:", title="Segurança")
         pwd = d.get_input()
         if not pwd or not self.storage.verify_admin(self.logged_admin, pwd):
             return messagebox.showerror("Erro", "Senha incorreta ou cancelado.")
@@ -367,7 +399,6 @@ class App(ctk.CTk):
         
         try:
             with zipfile.ZipFile(zip_path, 'r') as zipf:
-                # 1. Extrair os rostos (pastas de id dentro de data/faces)
                 for member in zipf.namelist():
                     if member.startswith("faces/") or member.startswith("faces\\"):
                         dest = os.path.join("data", member)
@@ -375,27 +406,22 @@ class App(ctk.CTk):
                         with open(dest, "wb") as f:
                             f.write(zipf.read(member))
                             
-                # 2. Ler o banco de dados via CSV
                 if "usuarios_db.csv" in zipf.namelist():
                     with zipf.open("usuarios_db.csv") as csvfile:
                         reader = csv.DictReader(csvfile.read().decode('utf-8').splitlines())
                         for row in reader:
-                            # Tenta criar. Se o nome ja existir, ignora ou tenta mesclar
                             try:
                                 self.storage.create_user(
-                                    name=row.get('Nome', ''),
-                                    cpf=row.get('CPF', ''),
-                                    email=row.get('Email', ''),
-                                    phone=row.get('Telefone', ''),
+                                    name=row.get('Nome', ''), cpf=row.get('CPF', ''),
+                                    email=row.get('Email', ''), phone=row.get('Telefone', ''),
                                     dependents=row.get('Dependentes', '')
                                 )
-                                self.storage.log_event("user_imported", details=f"{row.get('Nome')}")
-                            except Exception as e:
-                                pass # Já existe
+                                self.storage.log_event("user_imported", details=f"Usuario {row.get('Nome')}")
+                            except Exception: pass
                                 
-            # Como trouxemos novos rostos e usuários, re-treina o motor facial para reconhecê-los
             self.engine.train_from_db()
             self._load_users()
+            self.storage.log_event("admin_import", details="Massa de usuários e biometrias importada")
             messagebox.showinfo("Sucesso", "Usuários importados com sucesso! Motor biométrico atualizado.")
         except Exception as e:
             messagebox.showerror("Erro", f"Falha ao importar: {e}")
@@ -409,7 +435,7 @@ class App(ctk.CTk):
                     "dependents": form_data['dependents']
                 }
                 self.storage.update_user(form_data['id'], updates)
-                self.storage.log_event("user_edited", user_id=form_data['id'])
+                self.storage.log_event("admin_edited_user", details=f"Editado user ID {form_data['id']}")
                 self._load_users()
                 messagebox.showinfo("Sucesso", "Dados do usuário atualizados.")
             except Exception as e:
@@ -424,23 +450,21 @@ class App(ctk.CTk):
 
         def _start_enroll():
             try:
-                # Criar usuário no banco
                 u = self.storage.create_user(
-                    name=form_data['name'], 
-                    cpf=form_data['cpf'], 
-                    email=form_data['email'], 
-                    phone=form_data['phone'], 
+                    name=form_data['name'], cpf=form_data['cpf'], 
+                    email=form_data['email'], phone=form_data['phone'], 
                     dependents=form_data['dependents']
                 )
                 
-                # Criar admin se solicitado
                 if form_data.get('is_admin'):
                     self.storage.create_admin(form_data['admin_login'], form_data['admin_pwd'])
+                    self.storage.log_event("admin_created_admin", details=f"Novo admin: {form_data['admin_login']}")
 
                 p = Path(f"data/faces/{u.id}")
                 p.mkdir(parents=True, exist_ok=True)
                 self.enroll_data = {"id": u.id, "name": form_data['name'], "count": 0, "dir": p}
                 self.is_enrolling = True
+                self.storage.log_event("admin_created_user", details=f"Novo usuario: {form_data['name']}")
             except Exception as e:
                 messagebox.showerror("Erro", str(e))
 
@@ -450,15 +474,16 @@ class App(ctk.CTk):
         for i in self.tree.get_children(): self.tree.delete(i)
         for u in self.storage.list_users():
             status = "● ATIVO" if u.active else "○ INATIVO"
-            self.tree.insert("", "end", values=(u.id, u.name, u.cpf, status, u.created_at))
+            self.tree.insert("", "end", values=(u.id, u.name, format_cpf(u.cpf), status, u.created_at))
 
     def _toggle_status(self):
         if not self.logged_admin: return
         sel = self.tree.selection()
         if sel:
             uid = self.tree.item(sel[0])['values'][0]
-            curr = self.tree.item(sel[0])['values'][2]
+            curr = self.tree.item(sel[0])['values'][3]
             self.storage.set_user_active(uid, 0 if "●" in curr else 1)
+            self.storage.log_event("admin_toggled_status", details=f"User ID: {uid}")
             self._load_users()
 
     def _del_user(self):
@@ -466,8 +491,9 @@ class App(ctk.CTk):
         sel = self.tree.selection()
         if sel:
             uid = self.tree.item(sel[0])['values'][0]
-            if messagebox.askyesno("Confirmar", "Deletar usuário e biometria?"):
+            if messagebox.askyesno("Confirmar", "Deletar usuário e biometria definitivamente?"):
                 self.storage.delete_user(uid)
+                self.storage.log_event("admin_deleted_user", details=f"User ID: {uid} deletado")
                 self._load_users()
 
     def _show_gallery(self):
@@ -530,106 +556,166 @@ class EnrollForm(ctk.CTkToplevel):
         super().__init__(parent)
         self.parent = parent
         self.user_data = user_data
+        self.is_edit = bool(user_data)
         
-        is_edit = bool(user_data)
-        
-        self.title("Editar Usuário" if is_edit else "Novo Cadastro")
-        self.geometry("500x750")
+        self.title("Editar Usuário" if self.is_edit else "Novo Cadastro")
+        self.geometry("600x850")
+        self.attributes("-topmost", True)
         
         self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
         
-        ctk.CTkLabel(self, text="Dados do Usuário", font=("Segoe UI", 20, "bold")).grid(row=0, column=0, pady=20)
+        self.scroll_frame = ctk.CTkScrollableFrame(self)
+        self.scroll_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        
+        ctk.CTkLabel(self.scroll_frame, text="Dados do Usuário", font=("Segoe UI", 20, "bold")).pack(pady=20)
         
         # Form Fields
         self.entries = {}
         fields = [
             ("name", "Nome Completo *"),
-            ("cpf", "CPF *"),
-            ("email", "Email"),
-            ("phone", "Telefone"),
-            ("dependents", "Dependentes (Nomes)")
+            ("cpf", "CPF * (Apenas números)"),
+            ("email", "Email *"),
+            ("phone", "Telefone Celular * (Ex: 11999999999)")
         ]
         
-        for i, (key, label) in enumerate(fields):
-            ctk.CTkLabel(self, text=label).grid(row=i*2+1, column=0, sticky="w", padx=40)
-            e = ctk.CTkEntry(self, width=400)
-            e.grid(row=i*2+2, column=0, padx=40, pady=(0, 10))
-            if is_edit and key in user_data:
-                e.insert(0, str(user_data[key]))
+        for key, label in fields:
+            ctk.CTkLabel(self.scroll_frame, text=label).pack(anchor="w", padx=40)
+            e = ctk.CTkEntry(self.scroll_frame, width=450)
+            e.pack(padx=40, pady=(0, 15))
+            if self.is_edit and key in user_data:
+                val = str(user_data[key])
+                if key == 'cpf': val = format_cpf(val)
+                elif key == 'phone': val = format_phone(val)
+                e.insert(0, val)
+            
+            if key == 'cpf': e.bind('<KeyRelease>', lambda ev, entry=e: self._mask_cpf(ev, entry))
+            if key == 'phone': e.bind('<KeyRelease>', lambda ev, entry=e: self._mask_phone(ev, entry))
             self.entries[key] = e
             
-        # Admin Section (Apenas novo cadastro ou autorização de edição)
+        # Dependentes
+        self.has_dependents = ctk.BooleanVar(value=False)
+        self.chk_deps = ctk.CTkCheckBox(self.scroll_frame, text="Adicionar Dependentes / Autorizados Extras", variable=self.has_dependents, command=self._toggle_deps)
+        self.chk_deps.pack(anchor="w", padx=40, pady=10)
+        
+        self.deps_frame = ctk.CTkFrame(self.scroll_frame, fg_color="transparent")
+        ctk.CTkLabel(self.deps_frame, text="Nomes e Parentesco (Um por linha):").pack(anchor="w")
+        self.dep_text = ctk.CTkTextbox(self.deps_frame, width=450, height=100)
+        self.dep_text.pack(pady=5)
+        
+        if self.is_edit and user_data.get('dependents'):
+            self.has_dependents.set(True)
+            self.dep_text.insert("0.0", user_data['dependents'])
+            self._toggle_deps()
+            
+        # Admin Section
         self.is_admin_var = ctk.BooleanVar(value=False)
+        self.admin_frame = ctk.CTkFrame(self.scroll_frame, fg_color="transparent")
         
-        self.admin_frame = ctk.CTkFrame(self, fg_color="transparent")
-        
-        if is_edit:
-            ctk.CTkLabel(self.admin_frame, text="Autorização (Admin Atual) Obrigatória para Edição:").pack(anchor="w")
-            self.auth_login = ctk.CTkEntry(self.admin_frame, width=400, placeholder_text="Login do admin")
-            self.auth_login.pack(pady=5)
-            self.auth_pwd = ctk.CTkEntry(self.admin_frame, width=400, placeholder_text="Senha do admin", show="*")
+        if self.is_edit:
+            ctk.CTkLabel(self.admin_frame, text="Validação de Segurança (Admin Atual):", text_color="#d97706").pack(anchor="w", pady=(10,0))
+            self.auth_pwd = ctk.CTkEntry(self.admin_frame, width=450, placeholder_text="Senha do admin logado", show="*")
             self.auth_pwd.pack(pady=5)
-            self.admin_frame.grid(row=16, column=0, padx=40, sticky="nsew", pady=20)
+            self.admin_frame.pack(padx=40, fill="x", pady=20)
         else:
-            self.chk_admin = ctk.CTkCheckBox(self, text="Conceder Privilégios de Administrador", variable=self.is_admin_var, command=self._toggle_admin)
-            self.chk_admin.grid(row=15, column=0, pady=20, padx=40, sticky="w")
+            self.chk_admin = ctk.CTkCheckBox(self.scroll_frame, text="Conceder Acesso ao Painel Admin", variable=self.is_admin_var, command=self._toggle_admin)
+            self.chk_admin.pack(anchor="w", padx=40, pady=(20, 10))
             
-            ctk.CTkLabel(self.admin_frame, text="Autorização (Admin Atual):").pack(anchor="w")
-            self.auth_login = ctk.CTkEntry(self.admin_frame, width=400, placeholder_text="Login do autorizador")
-            self.auth_login.pack(pady=5)
-            self.auth_pwd = ctk.CTkEntry(self.admin_frame, width=400, placeholder_text="Senha do autorizador", show="*")
+            ctk.CTkLabel(self.admin_frame, text="Autorização (Senha do Admin Logado):").pack(anchor="w")
+            self.auth_pwd = ctk.CTkEntry(self.admin_frame, width=450, placeholder_text="Sua senha", show="*")
             self.auth_pwd.pack(pady=5)
             
-            ctk.CTkLabel(self.admin_frame, text="Credenciais do Novo Admin:").pack(anchor="w", pady=(15,0))
-            self.new_admin_login = ctk.CTkEntry(self.admin_frame, width=400, placeholder_text="Novo Login")
+            ctk.CTkLabel(self.admin_frame, text="Credenciais do Novo Painel:").pack(anchor="w", pady=(15,0))
+            self.new_admin_login = ctk.CTkEntry(self.admin_frame, width=450, placeholder_text="Novo Login de Acesso")
             self.new_admin_login.pack(pady=5)
-            self.new_admin_pwd = ctk.CTkEntry(self.admin_frame, width=400, placeholder_text="Nova Senha", show="*")
+            self.new_admin_pwd = ctk.CTkEntry(self.admin_frame, width=450, placeholder_text="Nova Senha", show="*")
             self.new_admin_pwd.pack(pady=5)
         
-        # Botões
-        btn_text = "SALVAR EDIÇÕES" if is_edit else "INICIAR CAPTURA FACIAL"
-        self.btn_save = ctk.CTkButton(self, text=btn_text, height=45, command=self._submit)
-        self.btn_save.grid(row=17, column=0, pady=30)
+        btn_text = "SALVAR E ATUALIZAR" if self.is_edit else "VALIDAR E INICIAR CAPTURA FACIAL"
+        self.btn_save = ctk.CTkButton(self.scroll_frame, text=btn_text, height=50, command=self._submit)
+        self.btn_save.pack(pady=40)
         
-        self.grab_set()
+
+    def _mask_cpf(self, event, entry):
+        if event.keysym in ('BackSpace', 'Delete'): return
+        val = re.sub(r'\D', '', entry.get())
+        if len(val) > 11: val = val[:11]
+        entry.delete(0, 'end')
+        entry.insert(0, format_cpf(val))
+
+    def _mask_phone(self, event, entry):
+        if event.keysym in ('BackSpace', 'Delete'): return
+        val = re.sub(r'\D', '', entry.get())
+        if len(val) > 11: val = val[:11]
+        entry.delete(0, 'end')
+        entry.insert(0, format_phone(val))
+
+    def _toggle_deps(self):
+        if self.has_dependents.get():
+            self.deps_frame.pack(padx=40, fill="x")
+        else:
+            self.deps_frame.pack_forget()
 
     def _toggle_admin(self):
         if self.is_admin_var.get():
-            self.admin_frame.grid(row=16, column=0, padx=40, sticky="nsew")
+            self.admin_frame.pack(padx=40, fill="x")
         else:
-            self.admin_frame.grid_forget()
+            self.admin_frame.pack_forget()
+
+    def _validate_inputs(self, data):
+        # CPF
+        clean_cpf = re.sub(r'\D', '', data['cpf'])
+        if not cpf_validator.validate(clean_cpf): return "CPF Inválido."
+        data['cpf'] = clean_cpf
+            
+        # Email
+        email_regex = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
+        if not re.match(email_regex, data['email']): return "Email em formato inválido."
+            
+        # Telefone BR
+        try:
+            pt_number = phonenumbers.parse(data['phone'], "BR")
+            if not phonenumbers.is_valid_number(pt_number): return "Telefone celular inválido."
+            data['phone'] = re.sub(r'\D', '', data['phone'])
+        except Exception:
+            return "Telefone inválido."
+            
+        return None
 
     def _submit(self):
         data = {k: v.get().strip() for k, v in self.entries.items()}
-        is_edit = bool(self.user_data)
         
-        if not data['name'] or not data['cpf']:
-            messagebox.showerror("Erro", "Nome e CPF são obrigatórios.")
+        if not data['name'] or not data['cpf'] or not data['email'] or not data['phone']:
+            messagebox.showerror("Erro", "Preencha todos os campos obrigatórios (*).")
             return
             
-        if is_edit:
+        err = self._validate_inputs(data)
+        if err:
+            messagebox.showerror("Validação Recusada", err)
+            return
+            
+        data['dependents'] = self.dep_text.get("0.0", "end").strip() if self.has_dependents.get() else ""
+            
+        # Validação de Segurança Admin Local
+        a_pwd = self.auth_pwd.get()
+        if not a_pwd:
+            messagebox.showerror("Segurança", "É necessária a sua senha de Admin para confirmar a operação.")
+            return
+            
+        if not self.parent.storage.verify_admin(self.parent.logged_admin, a_pwd):
+            messagebox.showerror("Segurança", "Senha do administrador atual incorreta. Ação bloqueada.")
+            return
+
+        if self.is_edit:
             data['id'] = self.user_data['id']
-            a_log = self.auth_login.get().strip()
-            a_pwd = self.auth_pwd.get()
-            if not self.parent.storage.verify_admin(a_log, a_pwd):
-                messagebox.showerror("Erro", "Autorização de administrador atual negada.")
-                return
         else:
             data['is_admin'] = self.is_admin_var.get()
             if data['is_admin']:
-                a_log = self.auth_login.get().strip()
-                a_pwd = self.auth_pwd.get()
-                
-                if not self.parent.storage.verify_admin(a_log, a_pwd):
-                    messagebox.showerror("Erro", "Autorização de administrador atual negada.")
-                    return
-                    
                 n_log = self.new_admin_login.get().strip()
                 n_pwd = self.new_admin_pwd.get()
                 if not n_log or not n_pwd:
                     messagebox.showerror("Erro", "Credenciais do novo admin são obrigatórias.")
                     return
-                    
                 data['admin_login'] = n_log
                 data['admin_pwd'] = n_pwd
             
