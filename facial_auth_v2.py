@@ -121,6 +121,24 @@ class Storage:
             logger.error(f"Erro ao criar usuário: {e}")
             raise
 
+    def update_user(self, user_id: int, updates: dict) -> None:
+        try:
+            with self.conn:
+                if "name" in updates:
+                    clean_name = "".join([c for c in updates["name"].strip() if c.isalnum() or c in (" ", "-", "_")])
+                    if not clean_name: raise ValueError("Nome inválido.")
+                    updates["name"] = clean_name
+                    
+                fields = ", ".join([f"{k} = ?" for k in updates.keys()])
+                values = list(updates.values())
+                values.append(user_id)
+                self.conn.execute(f"UPDATE users SET {fields} WHERE id = ?", tuple(values))
+        except sqlite3.IntegrityError:
+            raise ValueError("O novo nome já existe no sistema.")
+        except sqlite3.Error as e:
+            logger.error(f"Erro ao atualizar usuário: {e}")
+            raise
+
     def set_user_active(self, user_id: int, active: int) -> None:
         try:
             with self.conn:
