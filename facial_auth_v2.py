@@ -77,7 +77,7 @@ class Storage:
     def _init_db(self) -> None:
         try:
             with self.conn:
-                self.conn.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+                self.conn.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, cpf TEXT DEFAULT '', email TEXT DEFAULT '', phone TEXT DEFAULT '', dependents TEXT DEFAULT '')")
                 
                 # Migração: adicionar colunas para dados extras
                 cursor = self.conn.execute("PRAGMA table_info(users)")
@@ -87,8 +87,8 @@ class Storage:
                 if "phone" not in cols: self.conn.execute("ALTER TABLE users ADD COLUMN phone TEXT DEFAULT ''")
                 if "dependents" not in cols: self.conn.execute("ALTER TABLE users ADD COLUMN dependents TEXT DEFAULT ''")
                 
-                self.conn.execute("CREATE TABLE IF NOT EXISTS face_samples (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, image_path TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(user_id) REFERENCES users(id))")
-                self.conn.execute("CREATE TABLE IF NOT EXISTS auth_events (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, event_type TEXT NOT NULL, confidence REAL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+                self.conn.execute("CREATE TABLE IF NOT EXISTS face_samples (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, image_path TEXT NOT NULL, created_at TEXT NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id))")
+                self.conn.execute("CREATE TABLE IF NOT EXISTS auth_events (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, event_type TEXT NOT NULL, confidence REAL, created_at TEXT NOT NULL)")
                 self.conn.execute("CREATE TABLE IF NOT EXISTS admins (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, salt TEXT, active INTEGER NOT NULL DEFAULT 1)")
                 
                 # Migração: Adicionar coluna 'salt' se não existir
@@ -118,7 +118,7 @@ class Storage:
         
         try:
             with self.conn:
-                cursor = self.conn.execute("INSERT INTO users(name, cpf, email, phone, dependents) VALUES (?, ?, ?, ?, ?)", (clean_name, cpf, email, phone, dependents))
+                cursor = self.conn.execute("INSERT INTO users(name, cpf, email, phone, dependents, created_at) VALUES (?, ?, ?, ?, ?, ?)", (clean_name, cpf, email, phone, dependents, get_br_time()))
                 return User(id=cursor.lastrowid, name=clean_name, cpf=cpf, email=email, phone=phone, dependents=dependents)
         except sqlite3.IntegrityError:
             raise ValueError(f"O usuário '{clean_name}' já existe.")
@@ -167,7 +167,7 @@ class Storage:
     def add_sample(self, user_id: int, image_path: str) -> None:
         try:
             with self.conn:
-                self.conn.execute("INSERT INTO face_samples(user_id, image_path) VALUES (?, ?)", (user_id, image_path))
+                self.conn.execute("INSERT INTO face_samples(user_id, image_path, created_at) VALUES (?, ?, ?)", (user_id, image_path, get_br_time()))
                 
                 rows = self.conn.execute("SELECT id, image_path FROM face_samples WHERE user_id = ? ORDER BY id ASC", (user_id,)).fetchall()
                 if len(rows) > REQUIRED_SAMPLES:
@@ -194,7 +194,7 @@ class Storage:
     def log_event(self, event_type: str, user_id: Optional[int] = None, confidence: Optional[float] = None) -> None:
         try:
             with self.conn:
-                self.conn.execute("INSERT INTO auth_events(user_id, event_type, confidence) VALUES (?, ?, ?)", (user_id, event_type, confidence))
+                self.conn.execute("INSERT INTO auth_events(user_id, event_type, confidence, created_at) VALUES (?, ?, ?, ?)", (user_id, event_type, confidence, get_br_time()))
         except sqlite3.Error as e:
             logger.warning(f"Falha ao registrar log no banco: {e}")
 
