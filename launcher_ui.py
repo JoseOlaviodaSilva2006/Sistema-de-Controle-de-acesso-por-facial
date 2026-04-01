@@ -672,13 +672,11 @@ class EnrollForm(ctk.CTkToplevel):
         email_regex = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
         if not re.match(email_regex, data['email']): return "Email em formato inválido."
             
-        # Telefone BR
-        try:
-            pt_number = phonenumbers.parse(data['phone'], "BR")
-            if not phonenumbers.is_valid_number(pt_number): return "Telefone celular inválido."
-            data['phone'] = re.sub(r'\D', '', data['phone'])
-        except Exception:
-            return "Telefone inválido."
+        # Telefone BR (mais flexível)
+        clean_phone = re.sub(r'\D', '', data['phone'])
+        if len(clean_phone) not in (10, 11): 
+            return "Telefone celular inválido (deve ter 10 ou 11 dígitos)."
+        data['phone'] = clean_phone
             
         return None
 
@@ -696,15 +694,16 @@ class EnrollForm(ctk.CTkToplevel):
             
         data['dependents'] = self.dep_text.get("0.0", "end").strip() if self.has_dependents.get() else ""
             
-        # Validação de Segurança Admin Local
-        a_pwd = self.auth_pwd.get()
-        if not a_pwd:
-            messagebox.showerror("Segurança", "É necessária a sua senha de Admin para confirmar a operação.")
-            return
-            
-        if not self.parent.storage.verify_admin(self.parent.logged_admin, a_pwd):
-            messagebox.showerror("Segurança", "Senha do administrador atual incorreta. Ação bloqueada.")
-            return
+        # Validação de Segurança Admin Local apenas quando exigido
+        if self.is_edit or self.is_admin_var.get():
+            a_pwd = self.auth_pwd.get()
+            if not a_pwd:
+                messagebox.showerror("Segurança", "É necessária a sua senha de Admin para confirmar a operação.")
+                return
+                
+            if not self.parent.storage.verify_admin(self.parent.logged_admin, a_pwd):
+                messagebox.showerror("Segurança", "Senha do administrador atual incorreta. Ação bloqueada.")
+                return
 
         if self.is_edit:
             data['id'] = self.user_data['id']

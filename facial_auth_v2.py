@@ -191,9 +191,11 @@ class Storage:
             return User(id=row[0], name=row[1], active=row[2]) if row else None
         except sqlite3.Error: return None
 
-    def log_event(self, event_type: str, user_id: Optional[int] = None, confidence: Optional[float] = None) -> None:
+    def log_event(self, event_type: str, user_id: Optional[int] = None, confidence: Optional[float] = None, details: str = "") -> None:
         try:
             with self.conn:
+                if details:
+                    event_type = f"{event_type} - {details}"
                 self.conn.execute("INSERT INTO auth_events(user_id, event_type, confidence, created_at) VALUES (?, ?, ?, ?)", (user_id, event_type, confidence, get_br_time()))
         except sqlite3.Error as e:
             logger.warning(f"Falha ao registrar log no banco: {e}")
