@@ -65,8 +65,10 @@ class App(ctk.CTk):
         self.cap = None
         self.is_cam_on = False
         self.is_enrolling = False
+        self.is_enrolling_dep = False
         self.logged_admin = None
         self.enroll_data = {"id": None, "name": "", "count": 0, "dir": None}
+        self.enroll_dep_data = {}
         self.stop_event = threading.Event()
         
         self.grid_columnconfigure(1, weight=1)
@@ -75,6 +77,8 @@ class App(ctk.CTk):
         self._init_sidebar()
         self._init_content_frames()
         self.select_frame("dash")
+        
+        self._start_camera_service()
         
     def _init_sidebar(self):
         self.sidebar = ctk.CTkFrame(self, width=220, corner_radius=0, fg_color="#1a1a1a")
@@ -112,19 +116,24 @@ class App(ctk.CTk):
         
         self.cam_box = ctk.CTkFrame(self.f_dash, corner_radius=15, fg_color="#000", border_width=2, border_color="#333")
         self.cam_box.grid(row=1, column=0, padx=40, pady=30, sticky="nsew")
-        self.v_label = ctk.CTkLabel(self.cam_box, text="CÂMERA OFFLINE", width=800, height=500)
+        self.v_label = ctk.CTkLabel(self.cam_box, text="INICIANDO SENSOR...", width=800, height=500)
         self.v_label.pack(padx=10, pady=10)
         
         ctrls = ctk.CTkFrame(self.f_dash, fg_color="transparent")
         ctrls.grid(row=2, column=0, pady=(0, 40))
-        self.btn_cam = ctk.CTkButton(ctrls, text="ATIVAR SISTEMA", width=250, height=55, font=("Segoe UI", 14, "bold"), command=self.toggle_cam)
-        self.btn_cam.pack(side="left", padx=10)
         self.btn_new = ctk.CTkButton(ctrls, text="NOVO CADASTRO", width=250, height=55, fg_color="#16a34a", font=("Segoe UI", 14, "bold"), command=self._show_enroll)
         self.btn_new.pack(side="left", padx=10)
 
         # Users
         self.f_users = ctk.CTkFrame(self, fg_color="transparent")
-        ctk.CTkLabel(self.f_users, text="Gerenciamento de Identidades", font=ctk.CTkFont(size=22, weight="bold")).pack(padx=40, pady=(40, 20), anchor="w")
+        ctk.CTkLabel(self.f_users, text="Gerenciamento de Identidades", font=ctk.CTkFont(size=22, weight="bold")).pack(padx=40, pady=(40, 10), anchor="w")
+        
+        # Filtros de Busca de Usuario
+        search_f = ctk.CTkFrame(self.f_users, fg_color="transparent")
+        search_f.pack(fill="x", padx=40, pady=5)
+        self.user_search_entry = ctk.CTkEntry(search_f, placeholder_text="Buscar por ID, Nome ou CPF...", width=400)
+        self.user_search_entry.pack(side="left")
+        ctk.CTkButton(search_f, text="Filtrar", width=100, command=self._load_users).pack(side="left", padx=10)
         
         u_tools = ctk.CTkFrame(self.f_users, fg_color="transparent")
         u_tools.pack(fill="x", padx=40, pady=10)
@@ -149,12 +158,41 @@ class App(ctk.CTk):
         # Logs
         self.f_logs = ctk.CTkFrame(self, fg_color="transparent")
         l_top = ctk.CTkFrame(self.f_logs, fg_color="transparent")
-        l_top.pack(fill="x", padx=40, pady=(40, 20))
+        l_top.pack(fill="x", padx=40, pady=(40, 10))
         ctk.CTkLabel(l_top, text="Registro de Eventos Criptografados", font=ctk.CTkFont(size=22, weight="bold")).pack(side="left")
         ctk.CTkButton(l_top, text="Exportar CSV", fg_color="#16a34a", command=self._export_logs).pack(side="right")
         
-        self.log_list = tk.Listbox(self.f_logs, bg="#111", fg="#bbb", font=("Consolas", 11), border=0)
-        self.log_list.pack(fill="both", expand=True, padx=40, pady=20)
+        log_filter_f = ctk.CTkFrame(self.f_logs, fg_color="transparent")
+        log_filter_f.pack(fill="x", padx=40, pady=5)
+        
+        self.log_type_filter = ctk.CTkComboBox(log_filter_f, values=["TODOS", "verify_granted", "verify_denied", "verify_unknown", "user_edited", "admin_login", "user_imported"], width=200)
+        self.log_type_filter.set("TODOS")
+        self.log_type_filter.pack(side="left", padx=5)
+        
+        self.log_date_filter = ctk.CTkEntry(log_filter_f, placeholder_text="Filtrar Data (Ex: YYYY-MM-DD)", width=200)
+        self.log_date_filter.pack(side="left", padx=5)
+        
+        ctk.CTkButton(log_filter_f, text="Buscar Logs", width=100, command=self._load_logs).pack(side="left", padx=10)
+
+        self.log_tree_frame = ctk.CTkFrame(self.f_logs, fg_color="#1a1a1a")
+        self.log_tree_frame.pack(fill="both", expand=True, padx=40, pady=20)
+        
+        self.log_tree = ttk.Treeview(self.log_tree_frame, columns=("ID", "DATA", "EVENTO", "USUARIO", "CONFIANCA", "IMG_PATH", "USER_ID"), show="headings")
+        for c in ("ID", "DATA", "EVENTO", "USUARIO", "CONFIANCA"):
+            self.log_tree.heading(c, text=c)
+        self.log_tree.heading("IMG_PATH", text="IMG_PATH")
+        self.log_tree.heading("USER_ID", text="USER_ID")
+        
+        self.log_tree.column("ID", width=50, anchor="center")
+        self.log_tree.column("DATA", width=150, anchor="center")
+        self.log_tree.column("EVENTO", width=200, anchor="w")
+        self.log_tree.column("USUARIO", width=200, anchor="w")
+        self.log_tree.column("CONFIANCA", width=80, anchor="center")
+        self.log_tree.column("IMG_PATH", width=0, stretch=False)
+        self.log_tree.column("USER_ID", width=0, stretch=False)
+        
+        self.log_tree.pack(fill="both", expand=True)
+        self.log_tree.bind("<Double-1>", self._on_log_double_click)
 
     def select_frame(self, tag):
         for b in (self.btn_dash, self.btn_users, self.btn_logs): b.configure(fg_color="transparent")

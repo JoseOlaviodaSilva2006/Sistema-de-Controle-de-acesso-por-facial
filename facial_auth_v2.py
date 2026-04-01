@@ -79,7 +79,6 @@ class Storage:
             with self.conn:
                 self.conn.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, cpf TEXT DEFAULT '', email TEXT DEFAULT '', phone TEXT DEFAULT '', dependents TEXT DEFAULT '')")
                 
-                # Migração: adicionar colunas para dados extras
                 cursor = self.conn.execute("PRAGMA table_info(users)")
                 cols = [row[1] for row in cursor.fetchall()]
                 if "cpf" not in cols: self.conn.execute("ALTER TABLE users ADD COLUMN cpf TEXT DEFAULT ''")
@@ -87,11 +86,27 @@ class Storage:
                 if "phone" not in cols: self.conn.execute("ALTER TABLE users ADD COLUMN phone TEXT DEFAULT ''")
                 if "dependents" not in cols: self.conn.execute("ALTER TABLE users ADD COLUMN dependents TEXT DEFAULT ''")
                 
+                # Check for unique index on cpf
+                idx_cursor = self.conn.execute("PRAGMA index_list(users)")
+                indexes = [row[1] for row in idx_cursor.fetchall()]
+                if "idx_users_cpf" not in indexes:
+                    # Ignore empty cpfs for uniqueness
+                    self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_cpf ON users(cpf) WHERE cpf != ''")
+                
+                self.conn.execute("CREATE TABLE IF NOT EXISTS dependents (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, name TEXT NOT NULL, cpf TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id))")
+                
                 self.conn.execute("CREATE TABLE IF NOT EXISTS face_samples (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, image_path TEXT NOT NULL, created_at TEXT NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id))")
-                self.conn.execute("CREATE TABLE IF NOT EXISTS auth_events (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, event_type TEXT NOT NULL, confidence REAL, created_at TEXT NOT NULL)")
+                
+                self.conn.execute("CREATE TABLE IF NOT EXISTS auth_events (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, event_type TEXT NOT NULL, confidence REAL, created_at TEXT NOT NULL, image_path TEXT DEFAULT '')")
+                
+                # Migração: Adicionar coluna 'image_path' em auth_events
+                cursor = self.conn.execute("PRAGMA table_info(auth_events)")
+                cols = [row[1] for row in cursor.fetchall()]
+                if "image_path" not in cols:
+                    self.conn.execute("ALTER TABLE auth_events ADD COLUMN image_path TEXT DEFAULT ''")
+                
                 self.conn.execute("CREATE TABLE IF NOT EXISTS admins (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, salt TEXT, active INTEGER NOT NULL DEFAULT 1)")
                 
-                # Migração: Adicionar coluna 'salt' se não existir
                 cursor = self.conn.execute("PRAGMA table_info(admins)")
                 cols = [row[1] for row in cursor.fetchall()]
                 if "salt" not in cols:
@@ -120,7 +135,9 @@ class Storage:
             with self.conn:
                 cursor = self.conn.execute("INSERT INTO users(name, cpf, email, phone, dependents, created_at) VALUES (?, ?, ?, ?, ?, ?)", (clean_name, cpf, email, phone, dependents, get_br_time()))
                 return User(id=cursor.lastrowid, name=clean_name, cpf=cpf, email=email, phone=phone, dependents=dependents)
-        except sqlite3.IntegrityError:
+        except sqlite3.IntegrityError as e:
+            if "cpf" in str(e).lower():
+                raise ValueError(f"O CPF '{cpf}' já está cadastrado no sistema.")
             raise ValueError(f"O usuário '{clean_name}' já existe.")
         except sqlite3.Error as e:
             logger.error(f"Erro ao criar usuário: {e}")
@@ -138,7 +155,9 @@ class Storage:
                 values = list(updates.values())
                 values.append(user_id)
                 self.conn.execute(f"UPDATE users SET {fields} WHERE id = ?", tuple(values))
-        except sqlite3.IntegrityError:
+        except sqlite3.IntegrityError as e:
+            if "cpf" in str(e).lower():
+                raise ValueError("Este CPF já está sendo utilizado por outro usuário.")
             raise ValueError("O novo nome já existe no sistema.")
         except sqlite3.Error as e:
             logger.error(f"Erro ao atualizar usuário: {e}")
@@ -153,16 +172,40 @@ class Storage:
 
     def delete_user(self, user_id: int) -> None:
         try:
-            # Pegar caminhos das fotos para deletar fisicamente
             paths = self.conn.execute("SELECT image_path FROM face_samples WHERE user_id = ?", (user_id,)).fetchall()
+            dep_paths = self.conn.execute("SELECT id FROM dependents WHERE user_id = ?", (user_id,)).fetchall()
             with self.conn:
                 self.conn.execute("DELETE FROM face_samples WHERE user_id = ?", (user_id,))
+                self.conn.execute("DELETE FROM dependents WHERE user_id = ?", (user_id,))
                 self.conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
             
             for (p,) in paths:
                 if os.path.exists(p): os.remove(p)
+            
+            for (d_id,) in dep_paths:
+                d_dir = Path(f"data/dependents/{d_id}")
+                if d_dir.exists():
+                    import shutil
+                    shutil.rmtree(d_dir, ignore_errors=True)
         except Exception as e:
             logger.error(f"Erro ao deletar usuário: {e}")
+
+    def add_dependent(self, user_id: int, name: str, cpf: str) -> int:
+        try:
+            with self.conn:
+                cursor = self.conn.execute("INSERT INTO dependents(user_id, name, cpf, created_at) VALUES (?, ?, ?, ?)", (user_id, name, cpf, get_br_time()))
+                return cursor.lastrowid
+        except sqlite3.IntegrityError:
+            raise ValueError(f"O CPF '{cpf}' já está registrado.")
+        except sqlite3.Error as e:
+            logger.error(f"Erro ao criar dependente: {e}")
+            raise
+
+    def get_dependents(self, user_id: int) -> List[dict]:
+        try:
+            rows = self.conn.execute("SELECT id, name, cpf FROM dependents WHERE user_id = ?", (user_id,)).fetchall()
+            return [{"id": r[0], "name": r[1], "cpf": r[2]} for r in rows]
+        except sqlite3.Error: return []
 
     def add_sample(self, user_id: int, image_path: str) -> None:
         try:
@@ -191,19 +234,19 @@ class Storage:
             return User(id=row[0], name=row[1], active=row[2]) if row else None
         except sqlite3.Error: return None
 
-    def log_event(self, event_type: str, user_id: Optional[int] = None, confidence: Optional[float] = None, details: str = "") -> None:
+    def log_event(self, event_type: str, user_id: Optional[int] = None, confidence: Optional[float] = None, details: str = "", image_path: str = "") -> None:
         try:
             with self.conn:
                 if details:
                     event_type = f"{event_type} - {details}"
-                self.conn.execute("INSERT INTO auth_events(user_id, event_type, confidence, created_at) VALUES (?, ?, ?, ?)", (user_id, event_type, confidence, get_br_time()))
+                self.conn.execute("INSERT INTO auth_events(user_id, event_type, confidence, created_at, image_path) VALUES (?, ?, ?, ?, ?)", (user_id, event_type, confidence, get_br_time(), image_path))
         except sqlite3.Error as e:
             logger.warning(f"Falha ao registrar log no banco: {e}")
 
-    def get_logs(self, limit: int = 50) -> List[dict]:
+    def get_logs(self) -> List[dict]:
         try:
-            rows = self.conn.execute("SELECT e.event_type, u.name, e.confidence, e.created_at FROM auth_events e LEFT JOIN users u ON e.user_id = u.id ORDER BY e.id DESC LIMIT ?", (limit,)).fetchall()
-            return [{"type": r[0], "user": r[1] or "---", "conf": r[2] or 0.0, "time": r[3]} for r in rows]
+            rows = self.conn.execute("SELECT e.id, e.event_type, u.name, e.confidence, e.created_at, e.image_path, e.user_id FROM auth_events e LEFT JOIN users u ON e.user_id = u.id ORDER BY e.id DESC").fetchall()
+            return [{"id": r[0], "type": r[1], "user": r[2] or "---", "conf": r[3] or 0.0, "time": r[4], "image_path": r[5], "user_id": r[6]} for r in rows]
         except sqlite3.Error: return []
 
     def _hash(self, password: str, salt: Optional[str] = None) -> Tuple[str, str]:
