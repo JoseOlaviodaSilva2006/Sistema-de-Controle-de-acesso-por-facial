@@ -10,6 +10,7 @@ from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
+from secure_storage import secure_io
 
 # Configuração de Logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -251,7 +252,7 @@ class FaceEngine:
         if not samples: return False
         images, labels = [], []
         for uid, path in samples:
-            img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            img = secure_io.load_decrypted_image(path, cv2.IMREAD_GRAYSCALE)
             if img is not None:
                 images.append(cv2.resize(img, FACE_SIZE))
                 labels.append(uid)
@@ -339,8 +340,8 @@ class AuthController:
                         if now - last_upd > 20.0: 
                             p = Path(f"data/faces/{user.id}")
                             p.mkdir(parents=True, exist_ok=True)
-                            fname = p / f"auto_{time.time_ns()}.jpg"
-                            cv2.imwrite(str(fname), face_gray, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                            fname = p / f"auto_{time.time_ns()}.enc"
+                            secure_io.save_encrypted_image(face_gray, str(fname), quality=85)
                             self.storage.add_sample(user.id, str(fname))
                             self.last_update_at[user.id] = now
                     else:
@@ -349,8 +350,8 @@ class AuthController:
 
                         denied_dir = Path("data/denied")
                         denied_dir.mkdir(parents=True, exist_ok=True)
-                        fname = denied_dir / f"denied_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
-                        cv2.imwrite(str(fname), frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                        fname = denied_dir / f"denied_{time.strftime('%Y%m%d_%H%M%S')}.enc"
+                        secure_io.save_encrypted_image(frame, str(fname), quality=80)
                     self.consecutive = 0
                 else:
                     label, detail = "VALIDANDO...", f"Analisando biometria [{self.consecutive}/{REQUIRED_CONSISTENT_MATCHES}]"
@@ -361,8 +362,8 @@ class AuthController:
                     self.storage.log_event("verify_unknown", details="low_confidence")
                     denied_dir = Path("data/denied")
                     denied_dir.mkdir(parents=True, exist_ok=True)
-                    fname = denied_dir / f"unknown_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
-                    cv2.imwrite(str(fname), frame, [cv2.IMWRITE_JPEG_QUALITY, 80])        
+                    fname = denied_dir / f"unknown_{time.strftime('%Y%m%d_%H%M%S')}.enc"
+                    secure_io.save_encrypted_image(frame, str(fname), quality=80)        
         VisualHelper.draw_hud(frame, rect, label, detail, color)
         return frame
 
