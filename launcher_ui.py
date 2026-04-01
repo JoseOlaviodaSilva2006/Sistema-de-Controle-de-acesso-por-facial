@@ -1,12 +1,16 @@
 import customtkinter as ctk
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from PIL import Image, ImageTk
 import cv2
 import threading
 import time
 import os
 from pathlib import Path
+import csv
+import zipfile
+import shutil
+
 from facial_auth_v2 import (
     Storage, FaceEngine, AuthController, DB_PATH, CASCADE_PATH, 
     MODEL_PATH, REQUIRED_SAMPLES, COLOR_PRIMARY, _open_camera
@@ -105,6 +109,8 @@ class App(ctk.CTk):
         u_tools = ctk.CTkFrame(self.f_users, fg_color="transparent")
         u_tools.pack(fill="x", padx=40, pady=10)
         ctk.CTkButton(u_tools, text="Atualizar Lista", width=120, command=self._load_users).pack(side="left", padx=5)
+        ctk.CTkButton(u_tools, text="Exportar Zip", fg_color="#2563eb", width=120, command=self._export_users).pack(side="left", padx=5)
+        
         ctk.CTkButton(u_tools, text="Inativar/Ativar", fg_color="#d97706", command=self._toggle_status).pack(side="right", padx=5)
         ctk.CTkButton(u_tools, text="Deletar Usuário", fg_color="#991b1b", command=self._del_user).pack(side="right", padx=5)
         ctk.CTkButton(u_tools, text="Ver Fotos", fg_color="#40adff", command=self._show_gallery).pack(side="right", padx=5)
@@ -112,15 +118,19 @@ class App(ctk.CTk):
         self.tree_frame = ctk.CTkFrame(self.f_users, fg_color="#1a1a1a")
         self.tree_frame.pack(fill="both", expand=True, padx=40, pady=20)
         
-        self.tree = ttk.Treeview(self.tree_frame, columns=("ID", "NOME", "STATUS", "DATA"), show="headings")
-        for c in ("ID", "NOME", "STATUS", "DATA"):
+        self.tree = ttk.Treeview(self.tree_frame, columns=("ID", "NOME", "CPF", "STATUS", "DATA"), show="headings")
+        for c in ("ID", "NOME", "CPF", "STATUS", "DATA"):
             self.tree.heading(c, text=c)
-            self.tree.column(c, anchor="center", width=150)
+            self.tree.column(c, anchor="center", width=120)
         self.tree.pack(fill="both", expand=True)
 
         # Logs
         self.f_logs = ctk.CTkFrame(self, fg_color="transparent")
-        ctk.CTkLabel(self.f_logs, text="Registro de Eventos", font=ctk.CTkFont(size=22, weight="bold")).pack(padx=40, pady=(40, 20), anchor="w")
+        l_top = ctk.CTkFrame(self.f_logs, fg_color="transparent")
+        l_top.pack(fill="x", padx=40, pady=(40, 20))
+        ctk.CTkLabel(l_top, text="Registro de Eventos", font=ctk.CTkFont(size=22, weight="bold")).pack(side="left")
+        ctk.CTkButton(l_top, text="Exportar CSV", fg_color="#16a34a", command=self._export_logs).pack(side="right")
+        
         self.log_list = tk.Listbox(self.f_logs, bg="#111", fg="#bbb", font=("Consolas", 11), border=0)
         self.log_list.pack(fill="both", expand=True, padx=40, pady=20)
 
@@ -268,31 +278,89 @@ class App(ctk.CTk):
             self.btn_login.configure(text="LOGOUT", fg_color="#991b1b")
         elif pwd: messagebox.showerror("Erro", "Senha incorreta.")
 
+    def _export_users(self):
+        if not self.logged_admin: return messagebox.showwarning("ADM", "Login ADM necessário.")
+        save_path = filedialog.asksaveasfilename(defaultextension=".zip", filetypes=[("ZIP files", "*.zip")], title="Exportar Usuários")
+        if not save_path: return
+        
+        try:
+            with zipfile.ZipFile(save_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                # Cria um CSV temporario com os usuários e adiciona ao zip
+                users = self.storage.list_users()
+                csv_path = "temp_users_export.csv"
+                with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+                    writer = csv.writer(csvfile)
+                    writer.writerow(["ID", "Nome", "CPF", "Email", "Telefone", "Dependentes", "Status", "Criado_Em"])
+                    for u in users:
+                        writer.writerow([u.id, u.name, u.cpf, u.email, u.phone, u.dependents, u.active, u.created_at])
+                
+                zipf.write(csv_path, arcname="usuarios_db.csv")
+                os.remove(csv_path)
+                
+                # Adiciona os rostos (encriptados)
+                faces_dir = Path("data/faces")
+                if faces_dir.exists():
+                    for root, _, files in os.walk(faces_dir):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            arcname = os.path.relpath(file_path, start="data")
+                            zipf.write(file_path, arcname=arcname)
+            
+            messagebox.showinfo("Exportar", f"Banco de usuários e biometria exportados com sucesso para:\n{save_path}")
+        except Exception as e:
+            messagebox.showerror("Erro na Exportação", str(e))
+
+    def _export_logs(self):
+        if not self.logged_admin: return messagebox.showwarning("ADM", "Login ADM necessário.")
+        save_path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")], title="Exportar Histórico")
+        if not save_path: return
+        
+        try:
+            logs = self.storage.get_logs(limit=10000) # Busca histórico maior
+            with open(save_path, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(["Data/Hora", "Evento", "Usuário", "Confiança"])
+                for log in logs:
+                    writer.writerow([log['time'], log['type'].upper(), log['user'], f"{log['conf']:.2f}"])
+            messagebox.showinfo("Exportar", f"Histórico salvo em:\n{save_path}")
+        except Exception as e:
+            messagebox.showerror("Erro", str(e))
+
     def _show_enroll(self):
         if not self.logged_admin: return messagebox.showwarning("ADM", "Login ADM necessário.")
-        
         if self.is_enrolling:
             messagebox.showwarning("Aviso", "Já existe um cadastro em andamento.")
             return
 
-        # Pede o nome ANTES de iniciar a câmera para evitar que o diálogo bloqueie a Thread Principal 
-        # e cause um Deadlock na atualização de frames da câmera.
-        name = ctk.CTkInputDialog(text="Nome do Usuário:", title="Cadastro").get_input()
-        if not name: return
+        EnrollForm(self)
 
+    def start_enroll_process(self, form_data):
         if not self.is_cam_on:
             self.toggle_cam()
             if not self.is_cam_on:
-                return # Falhou ao ligar a câmera
+                messagebox.showerror("Erro", "Falha ao iniciar câmera.")
+                return
 
         def _start_enroll():
             try:
-                u = self.storage.create_user(name)
+                # Criar usuário no banco
+                u = self.storage.create_user(
+                    name=form_data['name'], 
+                    cpf=form_data['cpf'], 
+                    email=form_data['email'], 
+                    phone=form_data['phone'], 
+                    dependents=form_data['dependents']
+                )
+                
+                # Criar admin se solicitado
+                if form_data.get('is_admin'):
+                    self.storage.create_admin(form_data['admin_login'], form_data['admin_pwd'])
+
                 p = Path(f"data/faces/{u.id}")
                 p.mkdir(parents=True, exist_ok=True)
-                self.enroll_data = {"id": u.id, "name": name, "count": 0, "dir": p}
+                self.enroll_data = {"id": u.id, "name": form_data['name'], "count": 0, "dir": p}
                 self.is_enrolling = True
-            except ValueError as e:
+            except Exception as e:
                 messagebox.showerror("Erro", str(e))
 
         self.after(500, _start_enroll)
@@ -301,7 +369,7 @@ class App(ctk.CTk):
         for i in self.tree.get_children(): self.tree.delete(i)
         for u in self.storage.list_users():
             status = "● ATIVO" if u.active else "○ INATIVO"
-            self.tree.insert("", "end", values=(u.id, u.name, status, u.created_at))
+            self.tree.insert("", "end", values=(u.id, u.name, u.cpf, status, u.created_at))
 
     def _toggle_status(self):
         if not self.logged_admin: return
@@ -375,6 +443,92 @@ class GalleryWindow(ctk.CTkToplevel):
         if messagebox.askyesno("Confirmar", "Excluir esta foto?"):
             os.remove(path)
             self._load_samples()
+
+class EnrollForm(ctk.CTkToplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent = parent
+        self.title("Novo Cadastro")
+        self.geometry("500x750")
+        
+        self.grid_columnconfigure(0, weight=1)
+        
+        ctk.CTkLabel(self, text="Dados do Usuário", font=("Segoe UI", 20, "bold")).grid(row=0, column=0, pady=20)
+        
+        # Form Fields
+        self.entries = {}
+        fields = [
+            ("name", "Nome Completo *"),
+            ("cpf", "CPF *"),
+            ("email", "Email"),
+            ("phone", "Telefone"),
+            ("dependents", "Dependentes (Nomes)")
+        ]
+        
+        for i, (key, label) in enumerate(fields):
+            ctk.CTkLabel(self, text=label).grid(row=i*2+1, column=0, sticky="w", padx=40)
+            e = ctk.CTkEntry(self, width=400)
+            e.grid(row=i*2+2, column=0, padx=40, pady=(0, 10))
+            self.entries[key] = e
+            
+        # Admin Section
+        self.is_admin_var = ctk.BooleanVar(value=False)
+        self.chk_admin = ctk.CTkCheckBox(self, text="Conceder Privilégios de Administrador", variable=self.is_admin_var, command=self._toggle_admin)
+        self.chk_admin.grid(row=15, column=0, pady=20, padx=40, sticky="w")
+        
+        self.admin_frame = ctk.CTkFrame(self, fg_color="transparent")
+        
+        ctk.CTkLabel(self.admin_frame, text="Autorização (Admin Atual):").pack(anchor="w")
+        self.auth_login = ctk.CTkEntry(self.admin_frame, width=400, placeholder_text="Login do autorizador")
+        self.auth_login.pack(pady=5)
+        self.auth_pwd = ctk.CTkEntry(self.admin_frame, width=400, placeholder_text="Senha do autorizador", show="*")
+        self.auth_pwd.pack(pady=5)
+        
+        ctk.CTkLabel(self.admin_frame, text="Credenciais do Novo Admin:").pack(anchor="w", pady=(15,0))
+        self.new_admin_login = ctk.CTkEntry(self.admin_frame, width=400, placeholder_text="Novo Login")
+        self.new_admin_login.pack(pady=5)
+        self.new_admin_pwd = ctk.CTkEntry(self.admin_frame, width=400, placeholder_text="Nova Senha", show="*")
+        self.new_admin_pwd.pack(pady=5)
+        
+        # Botões
+        self.btn_save = ctk.CTkButton(self, text="INICIAR CAPTURA FACIAL", height=45, command=self._submit)
+        self.btn_save.grid(row=17, column=0, pady=30)
+        
+        self.grab_set()
+
+    def _toggle_admin(self):
+        if self.is_admin_var.get():
+            self.admin_frame.grid(row=16, column=0, padx=40, sticky="nsew")
+        else:
+            self.admin_frame.grid_forget()
+
+    def _submit(self):
+        data = {k: v.get().strip() for k, v in self.entries.items()}
+        
+        if not data['name'] or not data['cpf']:
+            messagebox.showerror("Erro", "Nome e CPF são obrigatórios.")
+            return
+            
+        data['is_admin'] = self.is_admin_var.get()
+        if data['is_admin']:
+            a_log = self.auth_login.get().strip()
+            a_pwd = self.auth_pwd.get()
+            
+            if not self.parent.storage.verify_admin(a_log, a_pwd):
+                messagebox.showerror("Erro", "Autorização de administrador atual negada.")
+                return
+                
+            n_log = self.new_admin_login.get().strip()
+            n_pwd = self.new_admin_pwd.get()
+            if not n_log or not n_pwd:
+                messagebox.showerror("Erro", "Credenciais do novo admin são obrigatórias.")
+                return
+                
+            data['admin_login'] = n_log
+            data['admin_pwd'] = n_pwd
+            
+        self.destroy()
+        self.parent.start_enroll_process(data)
 
 if __name__ == "__main__":
     App().mainloop()

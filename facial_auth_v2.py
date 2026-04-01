@@ -54,6 +54,10 @@ class User:
     name: str
     active: int = 1
     created_at: str = ""
+    cpf: str = ""
+    email: str = ""
+    phone: str = ""
+    dependents: str = ""
 
 class Storage:
     def __init__(self, db_path: Path) -> None:
@@ -69,6 +73,15 @@ class Storage:
         try:
             with self.conn:
                 self.conn.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+                
+                # Migração: adicionar colunas para dados extras
+                cursor = self.conn.execute("PRAGMA table_info(users)")
+                cols = [row[1] for row in cursor.fetchall()]
+                if "cpf" not in cols: self.conn.execute("ALTER TABLE users ADD COLUMN cpf TEXT DEFAULT ''")
+                if "email" not in cols: self.conn.execute("ALTER TABLE users ADD COLUMN email TEXT DEFAULT ''")
+                if "phone" not in cols: self.conn.execute("ALTER TABLE users ADD COLUMN phone TEXT DEFAULT ''")
+                if "dependents" not in cols: self.conn.execute("ALTER TABLE users ADD COLUMN dependents TEXT DEFAULT ''")
+                
                 self.conn.execute("CREATE TABLE IF NOT EXISTS face_samples (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, image_path TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(user_id) REFERENCES users(id))")
                 self.conn.execute("CREATE TABLE IF NOT EXISTS auth_events (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, event_type TEXT NOT NULL, confidence REAL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
                 self.conn.execute("CREATE TABLE IF NOT EXISTS admins (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, salt TEXT, active INTEGER NOT NULL DEFAULT 1)")
@@ -88,21 +101,20 @@ class Storage:
 
     def list_users(self) -> List[User]:
         try:
-            rows = self.conn.execute("SELECT id, name, active, created_at FROM users ORDER BY id DESC").fetchall()
-            return [User(id=r[0], name=r[1], active=r[2], created_at=r[3]) for r in rows]
+            rows = self.conn.execute("SELECT id, name, active, created_at, cpf, email, phone, dependents FROM users ORDER BY id DESC").fetchall()
+            return [User(id=r[0], name=r[1], active=r[2], created_at=r[3], cpf=r[4], email=r[5], phone=r[6], dependents=r[7]) for r in rows]
         except sqlite3.Error as e:
             logger.error(f"Erro ao listar usuários: {e}")
             return []
 
-    def create_user(self, name: str) -> User:
-        # Sanitização de entrada (Whitelist de caracteres)
+    def create_user(self, name: str, cpf: str = "", email: str = "", phone: str = "", dependents: str = "") -> User:
         clean_name = "".join([c for c in name.strip() if c.isalnum() or c in (" ", "-", "_")])
         if not clean_name: raise ValueError("Nome de usuário contém apenas caracteres proibidos ou está vazio.")
         
         try:
             with self.conn:
-                cursor = self.conn.execute("INSERT INTO users(name) VALUES (?)", (clean_name,))
-                return User(id=cursor.lastrowid, name=clean_name)
+                cursor = self.conn.execute("INSERT INTO users(name, cpf, email, phone, dependents) VALUES (?, ?, ?, ?, ?)", (clean_name, cpf, email, phone, dependents))
+                return User(id=cursor.lastrowid, name=clean_name, cpf=cpf, email=email, phone=phone, dependents=dependents)
         except sqlite3.IntegrityError:
             raise ValueError(f"O usuário '{clean_name}' já existe.")
         except sqlite3.Error as e:
