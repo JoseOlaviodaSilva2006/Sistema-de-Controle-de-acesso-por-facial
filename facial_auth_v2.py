@@ -3,6 +3,7 @@ import hashlib
 import os
 import sqlite3
 import time
+import datetime
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,11 +11,15 @@ from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
+import pytz
 from secure_storage import secure_io
 
 # Configuração de Logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("AuraAuth")
+
+def get_br_time():
+    return datetime.datetime.now(pytz.timezone('America/Sao_Paulo')).strftime('%Y-%m-%d %H:%M:%S')
 
 def load_env():
     """Carregador simples de .env para evitar dependências extras se possível."""
@@ -54,6 +59,10 @@ class User:
     name: str
     active: int = 1
     created_at: str = ""
+    cpf: str = ""
+    email: str = ""
+    phone: str = ""
+    dependents: str = ""
 
 class Storage:
     def __init__(self, db_path: Path) -> None:
@@ -68,9 +77,18 @@ class Storage:
     def _init_db(self) -> None:
         try:
             with self.conn:
-                self.conn.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
-                self.conn.execute("CREATE TABLE IF NOT EXISTS face_samples (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, image_path TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(user_id) REFERENCES users(id))")
-                self.conn.execute("CREATE TABLE IF NOT EXISTS auth_events (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, event_type TEXT NOT NULL, confidence REAL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+                self.conn.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, cpf TEXT DEFAULT '', email TEXT DEFAULT '', phone TEXT DEFAULT '', dependents TEXT DEFAULT '')")
+                
+                # Migração: adicionar colunas para dados extras
+                cursor = self.conn.execute("PRAGMA table_info(users)")
+                cols = [row[1] for row in cursor.fetchall()]
+                if "cpf" not in cols: self.conn.execute("ALTER TABLE users ADD COLUMN cpf TEXT DEFAULT ''")
+                if "email" not in cols: self.conn.execute("ALTER TABLE users ADD COLUMN email TEXT DEFAULT ''")
+                if "phone" not in cols: self.conn.execute("ALTER TABLE users ADD COLUMN phone TEXT DEFAULT ''")
+                if "dependents" not in cols: self.conn.execute("ALTER TABLE users ADD COLUMN dependents TEXT DEFAULT ''")
+                
+                self.conn.execute("CREATE TABLE IF NOT EXISTS face_samples (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, image_path TEXT NOT NULL, created_at TEXT NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id))")
+                self.conn.execute("CREATE TABLE IF NOT EXISTS auth_events (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, event_type TEXT NOT NULL, confidence REAL, created_at TEXT NOT NULL)")
                 self.conn.execute("CREATE TABLE IF NOT EXISTS admins (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, salt TEXT, active INTEGER NOT NULL DEFAULT 1)")
                 
                 # Migração: Adicionar coluna 'salt' se não existir
@@ -88,25 +106,42 @@ class Storage:
 
     def list_users(self) -> List[User]:
         try:
-            rows = self.conn.execute("SELECT id, name, active, created_at FROM users ORDER BY id DESC").fetchall()
-            return [User(id=r[0], name=r[1], active=r[2], created_at=r[3]) for r in rows]
+            rows = self.conn.execute("SELECT id, name, active, created_at, cpf, email, phone, dependents FROM users ORDER BY id DESC").fetchall()
+            return [User(id=r[0], name=r[1], active=r[2], created_at=r[3], cpf=r[4], email=r[5], phone=r[6], dependents=r[7]) for r in rows]
         except sqlite3.Error as e:
             logger.error(f"Erro ao listar usuários: {e}")
             return []
 
-    def create_user(self, name: str) -> User:
-        # Sanitização de entrada (Whitelist de caracteres)
+    def create_user(self, name: str, cpf: str = "", email: str = "", phone: str = "", dependents: str = "") -> User:
         clean_name = "".join([c for c in name.strip() if c.isalnum() or c in (" ", "-", "_")])
         if not clean_name: raise ValueError("Nome de usuário contém apenas caracteres proibidos ou está vazio.")
         
         try:
             with self.conn:
-                cursor = self.conn.execute("INSERT INTO users(name) VALUES (?)", (clean_name,))
-                return User(id=cursor.lastrowid, name=clean_name)
+                cursor = self.conn.execute("INSERT INTO users(name, cpf, email, phone, dependents, created_at) VALUES (?, ?, ?, ?, ?, ?)", (clean_name, cpf, email, phone, dependents, get_br_time()))
+                return User(id=cursor.lastrowid, name=clean_name, cpf=cpf, email=email, phone=phone, dependents=dependents)
         except sqlite3.IntegrityError:
             raise ValueError(f"O usuário '{clean_name}' já existe.")
         except sqlite3.Error as e:
             logger.error(f"Erro ao criar usuário: {e}")
+            raise
+
+    def update_user(self, user_id: int, updates: dict) -> None:
+        try:
+            with self.conn:
+                if "name" in updates:
+                    clean_name = "".join([c for c in updates["name"].strip() if c.isalnum() or c in (" ", "-", "_")])
+                    if not clean_name: raise ValueError("Nome inválido.")
+                    updates["name"] = clean_name
+                    
+                fields = ", ".join([f"{k} = ?" for k in updates.keys()])
+                values = list(updates.values())
+                values.append(user_id)
+                self.conn.execute(f"UPDATE users SET {fields} WHERE id = ?", tuple(values))
+        except sqlite3.IntegrityError:
+            raise ValueError("O novo nome já existe no sistema.")
+        except sqlite3.Error as e:
+            logger.error(f"Erro ao atualizar usuário: {e}")
             raise
 
     def set_user_active(self, user_id: int, active: int) -> None:
@@ -132,7 +167,7 @@ class Storage:
     def add_sample(self, user_id: int, image_path: str) -> None:
         try:
             with self.conn:
-                self.conn.execute("INSERT INTO face_samples(user_id, image_path) VALUES (?, ?)", (user_id, image_path))
+                self.conn.execute("INSERT INTO face_samples(user_id, image_path, created_at) VALUES (?, ?, ?)", (user_id, image_path, get_br_time()))
                 
                 rows = self.conn.execute("SELECT id, image_path FROM face_samples WHERE user_id = ? ORDER BY id ASC", (user_id,)).fetchall()
                 if len(rows) > REQUIRED_SAMPLES:
@@ -159,7 +194,7 @@ class Storage:
     def log_event(self, event_type: str, user_id: Optional[int] = None, confidence: Optional[float] = None) -> None:
         try:
             with self.conn:
-                self.conn.execute("INSERT INTO auth_events(user_id, event_type, confidence) VALUES (?, ?, ?)", (user_id, event_type, confidence))
+                self.conn.execute("INSERT INTO auth_events(user_id, event_type, confidence, created_at) VALUES (?, ?, ?, ?)", (user_id, event_type, confidence, get_br_time()))
         except sqlite3.Error as e:
             logger.warning(f"Falha ao registrar log no banco: {e}")
 
